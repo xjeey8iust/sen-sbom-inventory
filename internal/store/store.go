@@ -163,8 +163,11 @@ func (s *Store) Register(ctx context.Context, in *model.SBOM) (sbom *model.SBOM,
 }
 
 // List returns one page of complete SBOMs for an artifact ordered by ID, plus
-// the total number of matching manifests. Both reads run in one transaction so
-// the count and the page share the same snapshot.
+// the total number of matching manifests. The count, the page's manifests,
+// their components and their dependencies are four SELECT statements at most,
+// regardless of page size; the components and dependencies are bulk-loaded for
+// the current page only. All reads run in one transaction so the count and the
+// page share one committed snapshot and never expose a half-written manifest.
 func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (items []*model.SBOM, total int, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -172,39 +175,145 @@ func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (
 	}
 	defer tx.Rollback()
 
+	// SELECT 1: matching total, independent of the page window.
 	if err := tx.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM sboms WHERE artifact = ?", artifact,
 	).Scan(&total); err != nil {
 		return nil, 0, unavailable(err)
 	}
 
+	// SELECT 2: just the manifests of the current page.
 	rows, err := tx.QueryContext(ctx,
-		"SELECT id FROM sboms WHERE artifact = ? ORDER BY id ASC LIMIT ? OFFSET ?",
+		"SELECT id, artifact, version FROM sboms WHERE artifact = ? ORDER BY id ASC LIMIT ? OFFSET ?",
 		artifact, pageSize, (page-1)*pageSize)
 	if err != nil {
 		return nil, 0, unavailable(err)
 	}
-	defer rows.Close()
 
 	items = []*model.SBOM{}
+	ids := make([]int64, 0, pageSize)
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+		sbom := &model.SBOM{Components: []model.Component{}}
+		if err := rows.Scan(&sbom.ID, &sbom.Artifact, &sbom.Version); err != nil {
+			rows.Close()
 			return nil, 0, unavailable(err)
 		}
-		sbom, err := loadSBOM(ctx, tx, id)
-		if err != nil {
-			return nil, 0, err
-		}
 		items = append(items, sbom)
+		ids = append(ids, sbom.ID)
 	}
+	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, 0, unavailable(err)
 	}
+
+	// No ids means an unknown artifact or a page past the last one: the
+	// component and dependency SELECTs are skipped, not run with an empty IN.
+	if len(ids) > 0 {
+		// SELECT 3: every component of every manifest on this page, once.
+		if err := loadComponents(ctx, tx, items, ids); err != nil {
+			return nil, 0, err
+		}
+		// SELECT 4: every dependency edge of every manifest on this page, once.
+		if err := loadDependencies(ctx, tx, items, ids); err != nil {
+			return nil, 0, err
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, 0, unavailable(err)
 	}
 	return items, total, nil
+}
+
+// loadComponents bulk-loads the components of the page's manifests in a single
+// SELECT and attaches them coordinate-ordered to their manifest.
+func loadComponents(ctx context.Context, q queryer, items []*model.SBOM, ids []int64) error {
+	rows, err := q.QueryContext(ctx,
+		"SELECT sbom_id, coordinate, license FROM components WHERE sbom_id IN ("+
+			placeholderList(len(ids))+") ORDER BY sbom_id ASC, coordinate ASC",
+		int64Args(ids)...)
+	if err != nil {
+		return unavailable(err)
+	}
+	defer rows.Close()
+
+	byID := make(map[int64]int, len(items))
+	for i, sbom := range items {
+		byID[sbom.ID] = i
+	}
+	for rows.Next() {
+		var sbomID int64
+		var comp model.Component
+		comp.Dependencies = []string{}
+		if err := rows.Scan(&sbomID, &comp.Coordinate, &comp.License); err != nil {
+			return unavailable(err)
+		}
+		items[byID[sbomID]].Components = append(items[byID[sbomID]].Components, comp)
+	}
+	if err := rows.Err(); err != nil {
+		return unavailable(err)
+	}
+	return nil
+}
+
+// loadDependencies bulk-loads the dependency edges of the page's manifests in a
+// single SELECT and attaches the target coordinates to their source component,
+// ordered by source and target coordinate.
+func loadDependencies(ctx context.Context, q queryer, items []*model.SBOM, ids []int64) error {
+	rows, err := q.QueryContext(ctx, `
+SELECT sc.sbom_id, sc.coordinate, tc.coordinate
+FROM dependencies d
+JOIN components sc ON sc.id = d.component_id
+JOIN components tc ON tc.id = d.target_id
+WHERE sc.sbom_id IN (`+placeholderList(len(ids))+`)
+ORDER BY sc.sbom_id ASC, sc.coordinate ASC, tc.coordinate ASC`,
+		int64Args(ids)...)
+	if err != nil {
+		return unavailable(err)
+	}
+	defer rows.Close()
+
+	// One coordinate index per manifest: the same coordinate can legitimately
+	// occur in different versions, and its edges must never cross manifests.
+	coordinateIndex := make([]map[string]int, len(items))
+	for i, sbom := range items {
+		index := make(map[string]int, len(sbom.Components))
+		for j := range sbom.Components {
+			index[sbom.Components[j].Coordinate] = j
+		}
+		coordinateIndex[i] = index
+	}
+	byID := make(map[int64]int, len(items))
+	for i, sbom := range items {
+		byID[sbom.ID] = i
+	}
+	for rows.Next() {
+		var sbomID int64
+		var from, to string
+		if err := rows.Scan(&sbomID, &from, &to); err != nil {
+			return unavailable(err)
+		}
+		itemIndex := byID[sbomID]
+		comp := &items[itemIndex].Components[coordinateIndex[itemIndex][from]]
+		comp.Dependencies = append(comp.Dependencies, to)
+	}
+	if err := rows.Err(); err != nil {
+		return unavailable(err)
+	}
+	return nil
+}
+
+// placeholderList builds "?,?,?" for n bind parameters.
+func placeholderList(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+func int64Args(ids []int64) []any {
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	return args
 }
 
 // loadSBOM reconstructs a full manifest with components ordered by coordinate

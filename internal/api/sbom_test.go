@@ -374,6 +374,228 @@ func TestListRejectsBadQuery(t *testing.T) {
 	}
 }
 
+func TestListReturnsFullManifestsAcrossPages(t *testing.T) {
+	router, _ := newTestRouter(t)
+
+	// Seven manifests, each a distinct complete manifest: two components with
+	// one dependency edge, registered out of id order so id ordering is proven
+	// rather than implied.
+	versions := []string{"v7", "v2", "v4", "v1", "v6", "v3", "v5"}
+	for _, v := range versions {
+		body := fmt.Sprintf(`{"artifact":"app","version":"%s","components":[
+			{"coordinate":"depends-on","license":"L-%s","dependencies":["leaf"]},
+			{"coordinate":"leaf","license":"leaf-license","dependencies":[]}
+		]}`, v, v)
+		if rec := postSBOM(t, router, body); rec.Code != http.StatusCreated {
+			t.Fatalf("register %s: %d %s", v, rec.Code, rec.Body.String())
+		}
+		// Another artifact interleaved: its detail must never leak into pages.
+		if rec := postSBOM(t, router, fmt.Sprintf(
+			`{"artifact":"intruder","version":"%s","components":[{"coordinate":"foreign","license":"F","dependencies":[]}]}`, v,
+		)); rec.Code != http.StatusCreated {
+			t.Fatalf("register intruder %s: %d", v, rec.Code)
+		}
+	}
+
+	var seenIDs []int64
+	for page := 1; page <= 4; page++ {
+		rec := getSBOMs(t, router, fmt.Sprintf("/sboms?artifact=app&page=%d&pageSize=2", page))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("page %d: %d %s", page, rec.Code, rec.Body.String())
+		}
+		var got listResponse
+		decodeBody(t, rec, &got)
+		if got.Total != 7 {
+			t.Fatalf("page %d total = %d, want 7", page, got.Total)
+		}
+		if got.Page != page || got.PageSize != 2 {
+			t.Fatalf("page %d echoed %d/%d", page, got.Page, got.PageSize)
+		}
+		wantLen := 2
+		if page == 4 {
+			wantLen = 1
+		}
+		if len(got.Items) != wantLen {
+			t.Fatalf("page %d items = %d, want %d", page, len(got.Items), wantLen)
+		}
+		for _, item := range got.Items {
+			if item.Artifact != "app" {
+				t.Fatalf("item from another artifact leaked into the page: %+v", item)
+			}
+			if len(item.Components) != 2 {
+				t.Fatalf("partial manifest on page: %+v", item)
+			}
+			// Coordinate order and complete dependency edge on every item.
+			if item.Components[0].Coordinate != "depends-on" || item.Components[1].Coordinate != "leaf" {
+				t.Fatalf("components not coordinate-ordered: %+v", item.Components)
+			}
+			deps := item.Components[0].Dependencies
+			if len(deps) != 1 || deps[0] != "leaf" {
+				t.Fatalf("dependency edge missing on page item: %+v", item.Components)
+			}
+			if item.Components[0].License != "L-"+item.Version {
+				t.Fatalf("license belongs to another version: %+v", item)
+			}
+			seenIDs = append(seenIDs, item.ID)
+		}
+	}
+
+	if len(seenIDs) != 7 {
+		t.Fatalf("recovered %d manifests across pages, want 7", len(seenIDs))
+	}
+	for i := 1; i < len(seenIDs); i++ {
+		if seenIDs[i-1] >= seenIDs[i] {
+			t.Fatalf("cross-page ids not strictly ascending: %v", seenIDs)
+		}
+	}
+
+	// Past the last page: items is an empty array, total survives.
+	rec := getSBOMs(t, router, "/sboms?artifact=app&page=5&pageSize=2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("past end: %d", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"items":[]`)) {
+		t.Fatalf("past-end items is not an empty array: %s", rec.Body.String())
+	}
+	var past listResponse
+	decodeBody(t, rec, &past)
+	if past.Total != 7 || len(past.Items) != 0 || past.Page != 5 || past.PageSize != 2 {
+		t.Fatalf("past-end response = %+v", past)
+	}
+}
+
+func TestListIsolatesSameCoordinatesBetweenVersions(t *testing.T) {
+	router, _ := newTestRouter(t)
+
+	register := func(version, license, own string) {
+		t.Helper()
+		body := fmt.Sprintf(`{"artifact":"app","version":"%s","components":[
+			{"coordinate":"shared","license":"%s","dependencies":["%s"]},
+			{"coordinate":"%s","license":"L","dependencies":["shared"]}
+		]}`, version, license, own, own)
+		if rec := postSBOM(t, router, body); rec.Code != http.StatusCreated {
+			t.Fatalf("register %s: %d %s", version, rec.Code, rec.Body.String())
+		}
+	}
+	register("v1", "license-v1", "only-v1")
+	register("v2", "license-v2", "only-v2")
+
+	rec := getSBOMs(t, router, "/sboms?artifact=app")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list: %d %s", rec.Code, rec.Body.String())
+	}
+	var got listResponse
+	decodeBody(t, rec, &got)
+	if got.Total != 2 || len(got.Items) != 2 {
+		t.Fatalf("total/items = %d/%d, want 2/2", got.Total, len(got.Items))
+	}
+
+	byVersion := map[string]*model.SBOM{}
+	for _, item := range got.Items {
+		byVersion[item.Version] = item
+	}
+	for version, license := range map[string]string{"v1": "license-v1", "v2": "license-v2"} {
+		item := byVersion[version]
+		own := "only-" + version // only-v1 / only-v2
+		other := "only-v2"
+		if version == "v2" {
+			other = "only-v1"
+		}
+		if len(item.Components) != 2 {
+			t.Fatalf("version %s carries %d components, want 2", version, len(item.Components))
+		}
+		var shared, ownLeaf model.Component
+		for _, comp := range item.Components {
+			switch comp.Coordinate {
+			case "shared":
+				shared = comp
+			case own:
+				ownLeaf = comp
+			case other:
+				t.Fatalf("version %s leaked component %s from another version", version, comp.Coordinate)
+			default:
+				t.Fatalf("version %s has unexpected component %s", version, comp.Coordinate)
+			}
+		}
+		if shared.License != license {
+			t.Fatalf("shared license in %s = %q, want %q", version, shared.License, license)
+		}
+		if len(shared.Dependencies) != 1 || shared.Dependencies[0] != own {
+			t.Fatalf("shared deps in %s = %v, want [%s]", version, shared.Dependencies, own)
+		}
+		if len(ownLeaf.Dependencies) != 1 || ownLeaf.Dependencies[0] != "shared" {
+			t.Fatalf("leaf deps in %s = %v, want [shared]", version, ownLeaf.Dependencies)
+		}
+	}
+}
+
+func TestListSerializesEmptyCollectionsAsArrays(t *testing.T) {
+	router, _ := newTestRouter(t)
+
+	// Empty manifest.
+	if rec := postSBOM(t, router, `{"artifact":"app","version":"empty","components":[]}`); rec.Code != http.StatusCreated {
+		t.Fatalf("register empty: %d %s", rec.Code, rec.Body.String())
+	}
+	// Manifest with a component that has no dependencies.
+	if rec := postSBOM(t, router,
+		`{"artifact":"app","version":"leaf","components":[{"coordinate":"c","license":"L","dependencies":[]}]}`); rec.Code != http.StatusCreated {
+		t.Fatalf("register leaf: %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec := getSBOMs(t, router, "/sboms?artifact=app")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list: %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !bytes.Contains([]byte(body), []byte(`"components":[]`)) {
+		t.Fatalf("empty components not serialized as []: %s", body)
+	}
+	if !bytes.Contains([]byte(body), []byte(`"dependencies":[]`)) {
+		t.Fatalf("empty dependencies not serialized as []: %s", body)
+	}
+	if bytes.Contains([]byte(body), []byte(`null`)) {
+		t.Fatalf("response contains null where an array is required: %s", body)
+	}
+}
+
+func TestListReadFailureReturnsSingle503Envelope(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "service.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	router := NewRouter(st)
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	rec := getSBOMs(t, router, "/sboms?artifact=app&page=1&pageSize=20")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	var envelope map[string]any
+	decodeBody(t, rec, &envelope)
+	if len(envelope) != 1 {
+		t.Fatalf("response has %d top-level fields, want exactly one error object: %s", len(envelope), rec.Body.String())
+	}
+	errorObj, ok := envelope["error"].(map[string]any)
+	if !ok || len(errorObj) != 2 {
+		t.Fatalf("error envelope malformed: %s", rec.Body.String())
+	}
+	code, _ := errorObj["code"].(string)
+	message, _ := errorObj["message"].(string)
+	if code != "storage_unavailable" || message != "database is not available" {
+		t.Fatalf("code/message = %q/%q", code, message)
+	}
+	if _, present := envelope["items"]; present {
+		t.Fatalf("failure response must not carry partial items: %s", rec.Body.String())
+	}
+	for _, leaked := range []string{"SQLITE", "sql:", "goroutine", "SELECT", "/", ".go:"} {
+		if bytes.Contains(rec.Body.Bytes(), []byte(leaked)) {
+			t.Fatalf("error response leaks %q: %s", leaked, rec.Body.String())
+		}
+	}
+}
+
 func TestPersistsAcrossReopen(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "service.db")
