@@ -32,6 +32,7 @@ func NewRouter(st *store.Store) *gin.Engine {
 
 	router.POST("/sboms", h.register)
 	router.GET("/sboms", h.list)
+	router.GET("/sboms/diff", h.diff)
 
 	router.NoRoute(func(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"code": "route_not_found", "message": "no route matches this path"}})

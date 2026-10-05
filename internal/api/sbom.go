@@ -208,6 +208,26 @@ func (h *sbomHandlers) list(c *gin.Context) {
 	c.JSON(http.StatusOK, listResponse{Items: items, Total: total, Page: page, PageSize: pageSize})
 }
 
+// diff compares two registered versions of one artifact. The store returns
+// the complete wire shape; only normalized identifiers and the three
+// difference arrays ever leave the service.
+func (h *sbomHandlers) diff(c *gin.Context) {
+	artifact := strings.TrimSpace(c.Query("artifact"))
+	fromVersion := strings.TrimSpace(c.Query("fromVersion"))
+	toVersion := strings.TrimSpace(c.Query("toVersion"))
+	if artifact == "" || fromVersion == "" || toVersion == "" {
+		writeAPIError(c, http.StatusBadRequest, invalidInputCode, invalidDiffMessage)
+		return
+	}
+
+	result, err := h.store.Diff(c.Request.Context(), artifact, fromVersion, toVersion)
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
 // positiveQuery parses an optional query parameter that, when present, must be
 // a decimal positive integer (digits only, no sign, no spaces).
 func positiveQuery(c *gin.Context, name string, fallback int) (int, error) {
@@ -233,8 +253,11 @@ func positiveQuery(c *gin.Context, name string, fallback int) (int, error) {
 const (
 	invalidInputCode    = "InvalidSbomInputError"
 	conflictCode        = "SbomConflictError"
+	notFoundCode        = "SbomNotFoundError"
 	storageCode         = "storage_unavailable"
 	invalidInputMessage = "request is not a valid SBOM manifest"
+	invalidDiffMessage  = "request is not a valid SBOM diff query"
+	notFoundMessage     = "no registered SBOM exists for this artifact and version"
 	conflictMessage     = "an SBOM with different content already exists for this artifact and version"
 	storageMessage      = "database is not available"
 )
@@ -249,6 +272,8 @@ func writeStoreError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, model.ErrConflict):
 		writeAPIError(c, http.StatusConflict, conflictCode, conflictMessage)
+	case errors.Is(err, model.ErrNotFound):
+		writeAPIError(c, http.StatusNotFound, notFoundCode, notFoundMessage)
 	case errors.Is(err, model.ErrStorageUnavailable):
 		writeAPIError(c, http.StatusServiceUnavailable, storageCode, storageMessage)
 	default:

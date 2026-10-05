@@ -31,7 +31,31 @@ var (
 	// ErrConflict signals that an SBOM with the same artifact and version
 	// already exists with different content.
 	ErrConflict = errors.New("SbomConflictError")
+	// ErrNotFound signals that a request named an artifact/version combination
+	// no registered manifest exists for.
+	ErrNotFound = errors.New("SbomNotFoundError")
 	// ErrStorageUnavailable signals that the persistence layer cannot serve
 	// the request.
 	ErrStorageUnavailable = errors.New("storage_unavailable")
 )
+
+// ChangedComponent is one coordinate whose component exists in both compared
+// manifests but differs in license or in the set of direct dependency
+// coordinates; Before comes from the older manifest, After from the newer one.
+type ChangedComponent struct {
+	Coordinate string    `json:"coordinate"`
+	Before     Component `json:"before"`
+	After      Component `json:"after"`
+}
+
+// DiffResult is the comparison of two registered manifests of one artifact.
+// The three difference slices are always present on the wire (empty, never
+// null) and ordered by coordinate ascending.
+type DiffResult struct {
+	Artifact    string             `json:"artifact"`
+	FromVersion string             `json:"fromVersion"`
+	ToVersion   string             `json:"toVersion"`
+	Added       []Component        `json:"added"`
+	Removed     []Component        `json:"removed"`
+	Changed     []ChangedComponent `json:"changed"`
+}

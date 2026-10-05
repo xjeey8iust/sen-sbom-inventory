@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/xjeey8iust/sen-sbom-inventory/internal/model"
@@ -287,6 +288,134 @@ func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (
 		return nil, 0, txErr
 	}
 	return items, total, nil
+}
+
+// Diff compares two registered manifests of one artifact inside one read
+// transaction, so both manifests are reconstructed from one committed
+// snapshot — never from a half-written registration. The versions are only
+// identifiers: the first-named version is treated as the older manifest and
+// the second as the newer one, with no ordering inference between their
+// strings. When either version is missing it returns model.ErrNotFound; both
+// versions missing still produces that one error. Comparing a version with
+// itself yields three empty difference arrays as long as the manifest exists.
+func (s *Store) Diff(ctx context.Context, artifact, fromVersion, toVersion string) (result *model.DiffResult, err error) {
+	txErr := s.withTx(ctx, txDeferred, func(q preparer) error {
+		fromID, err := resolveSBOMID(ctx, q, artifact, fromVersion)
+		if err != nil {
+			return err
+		}
+		toID, err := resolveSBOMID(ctx, q, artifact, toVersion)
+		if err != nil {
+			return err
+		}
+
+		// Each manifest goes through the same loaders Register and List use, so
+		// components and dependencies are reconstructed exactly once per rule.
+		older, err := loadSBOM(ctx, q, fromID)
+		if err != nil {
+			return err
+		}
+		newer, err := loadSBOM(ctx, q, toID)
+		if err != nil {
+			return err
+		}
+		result = computeDiff(artifact, fromVersion, toVersion, older, newer)
+		return nil
+	})
+	if txErr != nil {
+		return nil, txErr
+	}
+	return result, nil
+}
+
+// resolveSBOMID locates one manifest by its normalized identity key. A missing
+// row is a business outcome (model.ErrNotFound), distinct from storage errors.
+func resolveSBOMID(ctx context.Context, q queryer, artifact, version string) (int64, error) {
+	var id int64
+	switch err := q.QueryRowContext(ctx,
+		"SELECT id FROM sboms WHERE artifact = ? AND version = ?",
+		artifact, version,
+	).Scan(&id); {
+	case err == nil:
+		return id, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return 0, model.ErrNotFound
+	default:
+		return 0, unavailable(err)
+	}
+}
+
+// computeDiff is the pure comparison rule: components are keyed by coordinate
+// within each manifest, so a coordinate rename is a removal plus an addition.
+// A coordinate present on both sides enters Changed only when the license or
+// the set of direct dependency coordinates differs; dependency changes of a
+// target component are never propagated to the components that reference it.
+// Dependencies are compared as sets, so registration-time array order cannot
+// influence the result. Transitive dependencies are not expanded.
+func computeDiff(artifact, fromVersion, toVersion string, older, newer *model.SBOM) *model.DiffResult {
+	result := &model.DiffResult{
+		Artifact:    artifact,
+		FromVersion: fromVersion,
+		ToVersion:   toVersion,
+		Added:       []model.Component{},
+		Removed:     []model.Component{},
+		Changed:     []model.ChangedComponent{},
+	}
+
+	olderByCoordinate := make(map[string]model.Component, len(older.Components))
+	for _, comp := range older.Components {
+		olderByCoordinate[comp.Coordinate] = comp
+	}
+	newerByCoordinate := make(map[string]model.Component, len(newer.Components))
+	for _, comp := range newer.Components {
+		newerByCoordinate[comp.Coordinate] = comp
+	}
+
+	for coordinate, after := range newerByCoordinate {
+		before, existed := olderByCoordinate[coordinate]
+		if !existed {
+			// Complete component from the newer manifest only.
+			result.Added = append(result.Added, after)
+			continue
+		}
+		if before.License != after.License || !sameDependencySet(before.Dependencies, after.Dependencies) {
+			result.Changed = append(result.Changed, model.ChangedComponent{
+				Coordinate: coordinate,
+				Before:     before,
+				After:      after,
+			})
+		}
+	}
+	for coordinate, before := range olderByCoordinate {
+		if _, exists := newerByCoordinate[coordinate]; !exists {
+			result.Removed = append(result.Removed, before)
+		}
+	}
+
+	// Components leave the loaders coordinate-sorted already, but the diff
+	// accumulates from maps; pin the contracted wire ordering explicitly.
+	sort.Slice(result.Added, func(i, j int) bool { return result.Added[i].Coordinate < result.Added[j].Coordinate })
+	sort.Slice(result.Removed, func(i, j int) bool { return result.Removed[i].Coordinate < result.Removed[j].Coordinate })
+	sort.Slice(result.Changed, func(i, j int) bool { return result.Changed[i].Coordinate < result.Changed[j].Coordinate })
+	return result
+}
+
+// sameDependencySet compares two direct dependency coordinate lists as sets;
+// neither order nor repetition carries meaning.
+func sameDependencySet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, dep := range a {
+		set[dep] = struct{}{}
+	}
+	for _, dep := range b {
+		if _, ok := set[dep]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // loadComponentsInto reads every component of the given manifests in one

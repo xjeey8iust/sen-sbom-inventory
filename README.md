@@ -75,6 +75,52 @@ go run .
 
 存储不可用时返回 503 `storage_unavailable`。
 
+### `GET /sboms/diff`
+
+比较同一制品已登记的两个版本。三个 query 参数均为必填字符串，去除首尾空白后精确匹配、区分大小写；任一缺失或去空白后为空返回 400 `InvalidSbomInputError`：
+
+- `artifact`：制品；
+- `fromVersion`：旧版本；
+- `toVersion`：新版本。
+
+版本只作标识，不推断版本先后：`fromVersion` 恒为“旧”侧、`toVersion` 恒为“新”侧，交换二者即交换差异方向。
+
+参数有效但任一版本不存在时返回 404 `SbomNotFoundError`；两个版本都不存在也只返回一个该错误。同版本与自身比较，仅在该清单存在时返回三个空数组。
+
+成功返回 HTTP 200，对象仅包含规范化后的三个标识字段与 `added`、`removed`、`changed`：
+
+```json
+{
+  "artifact": "app",
+  "fromVersion": "1.2.0",
+  "toVersion": "1.3.0",
+  "added": [{"coordinate": "lib-c", "license": "MIT", "dependencies": []}],
+  "removed": [{"coordinate": "lib-b", "license": "MIT", "dependencies": []}],
+  "changed": [{"coordinate": "lib-a",
+    "before": {"coordinate": "lib-a", "license": "Apache-2.0", "dependencies": ["lib-b"]},
+    "after": {"coordinate": "lib-a", "license": "Apache-2.0", "dependencies": []}
+  }]
+}
+```
+
+比对规则：
+
+- `added`：仅存在于新版本的完整组件；`removed`：仅存在于旧版本的完整组件；组件结构与登记响应一致（`coordinate`、`license`、`dependencies`，空依赖为 `[]`）；
+- 坐标相同的组件，仅当**许可证**或**直接依赖坐标集合**不同才进入 `changed`，每项包含 `coordinate` 以及来自旧、新清单的两个完整组件 `before`、`after`；坐标改名视为删除加新增，不作为 changed；未变化组件不输出；
+- 依赖只比较直接关系，不展开传递依赖；被引用组件的许可证变化不会传播给引用方；
+- 三个数组均按坐标字符串升序；组件内依赖保持登记后的既有升序；比对结果与登记时数组顺序无关（依赖按集合比较）；
+- 空清单与允许的非自身依赖环遵循同一规则；
+- `added`、`removed`、`changed` 始终是数组，无差异时为 `[]`。
+
+两份清单在同一个读事务、同一个已提交数据快照内重建，不会读到半写入清单；任一步读取失败返回 503 `storage_unavailable`，不返回部分差异。
+
 ## 错误约定
 
 所有错误响应都是单个顶层 `error` 对象，包含 `code` 与 `message` 两个字符串字段；`message` 不包含 SQL、堆栈或文件路径。
+
+| HTTP | code | 触发场景 |
+|---|---|---|
+| 400 | `InvalidSbomInputError` | 请求形态、字段或参数不合法（含 diff 参数缺失/空白） |
+| 404 | `SbomNotFoundError` | diff 指定的制品/版本没有已登记清单 |
+| 409 | `SbomConflictError` | 同 `artifact`/`version` 已存在且内容不同 |
+| 503 | `storage_unavailable` | 存储读、写、提交失败或其他未预期存储错误 |
