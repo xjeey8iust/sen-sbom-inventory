@@ -36,6 +36,12 @@ type Driver struct {
 	}
 	// failKind, when non-empty, makes the next SELECT of that kind fail.
 	failKind string
+	// failWriteKind, when non-empty, makes the next INSERT of that kind
+	// ("sboms"/"components"/"dependencies") fail, whether it is issued
+	// directly or through a prepared statement.
+	failWriteKind string
+	// failRollback makes the next ROLLBACK report failure.
+	failRollback bool
 }
 
 // DriverName is the database/sql name under which the counting driver is
@@ -59,12 +65,14 @@ func Register() *Driver {
 	return shared
 }
 
-// Reset clears the observed counters and any pending fault.
+// Reset clears the observed counters and every pending fault.
 func (d *Driver) Reset() {
 	d.mu.Lock()
 	d.stats.selects = 0
 	d.stats.rowsByKind = map[string]int{}
 	d.failKind = ""
+	d.failWriteKind = ""
+	d.failRollback = false
 	d.mu.Unlock()
 }
 
@@ -74,6 +82,24 @@ func (d *Driver) Reset() {
 func (d *Driver) FailNextRead(kind string) {
 	d.mu.Lock()
 	d.failKind = kind
+	d.mu.Unlock()
+}
+
+// FailNextWrite makes the next INSERT of kind
+// ("sboms"/"components"/"dependencies") fail, simulating a storage write
+// error during one detail-write step of a registration.
+func (d *Driver) FailNextWrite(kind string) {
+	d.mu.Lock()
+	d.failWriteKind = kind
+	d.mu.Unlock()
+}
+
+// FailNextRollback makes the next ROLLBACK statement report failure, so tests
+// can prove transaction-cleanup errors never overwrite the error that
+// triggered the rollback.
+func (d *Driver) FailNextRollback() {
+	d.mu.Lock()
+	d.failRollback = true
 	d.mu.Unlock()
 }
 
@@ -105,7 +131,35 @@ type countingConn struct {
 }
 
 func (c *countingConn) Exec(query string, args []driver.Value) (driver.Result, error) {
+	if isRollback(query) {
+		// Always run the real ROLLBACK first: the connection must actually
+		// leave its transaction before going back to the pool. The synthetic
+		// failure only reports what the store must learn to ignore.
+		res, err := c.Conn.(driver.Execer).Exec(query, args)
+		c.driver.mu.Lock()
+		fail := c.driver.failRollback
+		c.driver.failRollback = false
+		c.driver.mu.Unlock()
+		if fail {
+			return res, errors.New("forced rollback failure from test driver")
+		}
+		return res, err
+	}
+	if err := c.checkExecFault(query); err != nil {
+		return nil, err
+	}
 	return c.Conn.(driver.Execer).Exec(query, args)
+}
+
+// Prepare wraps prepared statements too: the store batches the component and
+// dependency inserts through a prepared statement, so a write fault has to be
+// visible on that path and not only for direct Exec calls.
+func (c *countingConn) Prepare(query string) (driver.Stmt, error) {
+	raw, err := c.Conn.Prepare(query)
+	if err != nil {
+		return nil, err
+	}
+	return &countingStmt{Stmt: raw, driver: c.driver, query: query}, nil
 }
 
 // ResetSession and IsValid delegate the optional driver interfaces so pooled
@@ -129,6 +183,10 @@ func (c *countingConn) Query(query string, args []driver.Value) (driver.Rows, er
 	if kind != "" {
 		c.driver.mu.Lock()
 		fail := c.driver.failKind == kind
+		if fail {
+			// A one-shot fault: consume it so only the next matching read fails.
+			c.driver.failKind = ""
+		}
 		c.driver.mu.Unlock()
 		if fail {
 			return nil, errors.New("forced read failure from test driver")
@@ -142,6 +200,48 @@ func (c *countingConn) Query(query string, args []driver.Value) (driver.Rows, er
 	c.driver.stats.selects++
 	c.driver.mu.Unlock()
 	return &countingRows{Rows: rows, driver: c.driver, kind: kind}, nil
+}
+
+// checkExecFault consumes any pending write fault for the statement and
+// returns the synthetic error when one fires. Callers must route ROLLBACK
+// elsewhere: that path runs the real rollback before reporting its synthetic
+// failure so a pooled connection never stays inside an open transaction.
+func (c *countingConn) checkExecFault(query string) error {
+	if kind := WriteKind(query); kind != "" {
+		c.driver.mu.Lock()
+		fire := c.driver.failWriteKind == kind
+		if fire {
+			c.driver.failWriteKind = ""
+		}
+		c.driver.mu.Unlock()
+		if fire {
+			return errors.New("forced write failure from test driver")
+		}
+	}
+	return nil
+}
+
+// countingStmt carries the originating query so the fault configured for that
+// statement's table fires on Exec.
+type countingStmt struct {
+	driver.Stmt
+	driver *Driver
+	query  string
+}
+
+func (s *countingStmt) Exec(args []driver.Value) (driver.Result, error) {
+	if kind := WriteKind(s.query); kind != "" {
+		s.driver.mu.Lock()
+		fire := s.driver.failWriteKind == kind
+		if fire {
+			s.driver.failWriteKind = ""
+		}
+		s.driver.mu.Unlock()
+		if fire {
+			return nil, errors.New("forced write failure from test driver")
+		}
+	}
+	return s.Stmt.Exec(args)
 }
 
 type countingRows struct {
@@ -177,4 +277,26 @@ func SelectKind(query string) string {
 	default:
 		return "sboms"
 	}
+}
+
+// WriteKind classifies the store's INSERT statements so tests can target one
+// detail-write step: "sboms", "components" or "dependencies". Every other
+// statement returns the empty string.
+func WriteKind(query string) string {
+	s := strings.ToUpper(strings.TrimSpace(query))
+	if !strings.HasPrefix(s, "INSERT INTO") {
+		return ""
+	}
+	switch {
+	case strings.HasPrefix(s, "INSERT INTO COMPONENTS"):
+		return "components"
+	case strings.HasPrefix(s, "INSERT INTO DEPENDENCIES"):
+		return "dependencies"
+	default:
+		return "sboms"
+	}
+}
+
+func isRollback(query string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "ROLLBACK")
 }

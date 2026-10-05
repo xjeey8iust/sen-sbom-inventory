@@ -64,108 +64,168 @@ type queryer interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// preparer is the transaction surface a write callback gets: the loaders'
+// queryer plus context-aware statement preparation for the batched detail
+// inserts. *sql.Conn satisfies it.
+type preparer interface {
+	queryer
+	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
+}
+
+// txMode selects how a managed transaction starts.
+type txMode int
+
+const (
+	// txDeferred issues a plain BEGIN: a read transaction that pins one
+	// committed snapshot for every SELECT inside it.
+	txDeferred txMode = iota
+	// txImmediate issues BEGIN IMMEDIATE, taking the writer lock up front.
+	txImmediate
+)
+
+// withTx is the single transaction lifecycle rule of the service; Register and
+// List both run their work through it, so the lifecycle is verifiable from one
+// place instead of being maintained twice:
+//
+//  1. acquire a dedicated connection and return it to the pool on every exit
+//     (deferred Conn.Close);
+//  2. begin the transaction in the requested mode;
+//  3. run fn against that connection;
+//  4. COMMIT exactly once when fn succeeds; otherwise — including an early
+//     business return such as model.ErrConflict — best-effort ROLLBACK.
+//
+// The error fn returns is passed through untouched, so sentinel business
+// errors stay errors.Is-recognizable and a storage error keeps its original
+// cause. A failure of COMMIT itself is mapped to model.ErrStorageUnavailable;
+// a failure of the best-effort ROLLBACK is deliberately swallowed so it can
+// never replace the already-determined business or storage error.
+func (s *Store) withTx(ctx context.Context, mode txMode, fn func(q preparer) error) error {
+	c, err := s.db.Conn(ctx)
+	if err != nil {
+		return unavailable(err)
+	}
+	// Rule 1: the connection is always returned, on success, business error
+	// and storage failure alike.
+	defer c.Close()
+
+	begin := "BEGIN"
+	if mode == txImmediate {
+		// BEGIN IMMEDIATE takes the writer lock up front, so two concurrent
+		// registrations for the same artifact/version serialize and the loser
+		// re-reads the winner's committed row instead of hitting the unique
+		// constraint.
+		begin = "BEGIN IMMEDIATE"
+	}
+	if _, err := c.ExecContext(ctx, begin); err != nil {
+		return unavailable(err)
+	}
+
+	committed := false
+	// Rule 4: any exit without a successful COMMIT rolls back. The cleanup is
+	// best effort and its error is discarded on purpose.
+	defer func() {
+		if !committed {
+			_, _ = c.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	if err := fn(c); err != nil {
+		return err
+	}
+	if _, err := c.ExecContext(ctx, "COMMIT"); err != nil {
+		return unavailable(err)
+	}
+	committed = true
+	return nil
+}
+
 // Register persists a normalized SBOM in a single write transaction. When the
 // same artifact and version already hold an identical manifest, the existing
 // record (with its original ID) is returned and created is false. Different
 // content leaves the existing record untouched and returns model.ErrConflict.
 func (s *Store) Register(ctx context.Context, in *model.SBOM) (sbom *model.SBOM, created bool, err error) {
-	c, err := s.db.Conn(ctx)
-	if err != nil {
-		return nil, false, unavailable(err)
-	}
-	defer c.Close()
-
-	// BEGIN IMMEDIATE takes the writer lock up front, so two concurrent
-	// registrations for the same artifact/version serialize and the loser
-	// re-reads the winner's committed row instead of hitting the unique
-	// constraint.
-	if _, err := c.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return nil, false, unavailable(err)
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			// Best-effort cleanup; the original error is what callers need.
-			_, _ = c.ExecContext(context.Background(), "ROLLBACK")
+	var result *model.SBOM
+	createdResult := false
+	txErr := s.withTx(ctx, txImmediate, func(q preparer) error {
+		var existingID int64
+		switch err := q.QueryRowContext(ctx,
+			"SELECT id FROM sboms WHERE artifact = ? AND version = ?",
+			in.Artifact, in.Version,
+		).Scan(&existingID); {
+		case err == nil:
+			existing, err := loadSBOM(ctx, q, existingID)
+			if err != nil {
+				return err
+			}
+			if !equalContent(existing, in) {
+				return model.ErrConflict
+			}
+			result = existing
+			return nil
+		case errors.Is(err, sql.ErrNoRows):
+			// Continue and insert.
+		default:
+			return unavailable(err)
 		}
-	}()
 
-	var existingID int64
-	switch err := c.QueryRowContext(ctx,
-		"SELECT id FROM sboms WHERE artifact = ? AND version = ?",
-		in.Artifact, in.Version,
-	).Scan(&existingID); {
-	case err == nil:
-		existing, err := loadSBOM(ctx, c, existingID)
+		res, err := q.ExecContext(ctx,
+			"INSERT INTO sboms (artifact, version) VALUES (?, ?)",
+			in.Artifact, in.Version)
 		if err != nil {
-			return nil, false, err
+			return unavailable(err)
 		}
-		if !equalContent(existing, in) {
-			return nil, false, model.ErrConflict
-		}
-		return existing, false, nil
-	case errors.Is(err, sql.ErrNoRows):
-		// Continue and insert.
-	default:
-		return nil, false, unavailable(err)
-	}
-
-	res, err := c.ExecContext(ctx,
-		"INSERT INTO sboms (artifact, version) VALUES (?, ?)",
-		in.Artifact, in.Version)
-	if err != nil {
-		return nil, false, unavailable(err)
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return nil, false, unavailable(err)
-	}
-
-	componentID := make(map[string]int64, len(in.Components))
-	insertComponent, err := c.PrepareContext(ctx,
-		"INSERT INTO components (sbom_id, coordinate, license) VALUES (?, ?, ?)")
-	if err != nil {
-		return nil, false, unavailable(err)
-	}
-	defer insertComponent.Close()
-	for i := range in.Components {
-		comp := &in.Components[i]
-		res, err := insertComponent.ExecContext(ctx, id, comp.Coordinate, comp.License)
+		id, err := res.LastInsertId()
 		if err != nil {
-			return nil, false, unavailable(err)
+			return unavailable(err)
 		}
-		compID, err := res.LastInsertId()
-		if err != nil {
-			return nil, false, unavailable(err)
-		}
-		componentID[comp.Coordinate] = compID
-	}
 
-	if depCount := countDependencies(in); depCount > 0 {
-		insertDep, err := c.PrepareContext(ctx,
-			"INSERT INTO dependencies (component_id, target_id) VALUES (?, ?)")
+		componentID := make(map[string]int64, len(in.Components))
+		insertComponent, err := q.PrepareContext(ctx,
+			"INSERT INTO components (sbom_id, coordinate, license) VALUES (?, ?, ?)")
 		if err != nil {
-			return nil, false, unavailable(err)
+			return unavailable(err)
 		}
-		defer insertDep.Close()
+		defer insertComponent.Close()
 		for i := range in.Components {
 			comp := &in.Components[i]
-			for _, dep := range comp.Dependencies {
-				if _, err := insertDep.ExecContext(ctx, componentID[comp.Coordinate], componentID[dep]); err != nil {
-					return nil, false, unavailable(err)
+			res, err := insertComponent.ExecContext(ctx, id, comp.Coordinate, comp.License)
+			if err != nil {
+				return unavailable(err)
+			}
+			compID, err := res.LastInsertId()
+			if err != nil {
+				return unavailable(err)
+			}
+			componentID[comp.Coordinate] = compID
+		}
+
+		if depCount := countDependencies(in); depCount > 0 {
+			insertDep, err := q.PrepareContext(ctx,
+				"INSERT INTO dependencies (component_id, target_id) VALUES (?, ?)")
+			if err != nil {
+				return unavailable(err)
+			}
+			defer insertDep.Close()
+			for i := range in.Components {
+				comp := &in.Components[i]
+				for _, dep := range comp.Dependencies {
+					if _, err := insertDep.ExecContext(ctx, componentID[comp.Coordinate], componentID[dep]); err != nil {
+						return unavailable(err)
+					}
 				}
 			}
 		}
-	}
 
-	if _, err := c.ExecContext(ctx, "COMMIT"); err != nil {
-		return nil, false, unavailable(err)
+		out := *in
+		out.ID = id
+		result = &out
+		createdResult = true
+		return nil
+	})
+	if txErr != nil {
+		return nil, false, txErr
 	}
-	committed = true
-
-	out := *in
-	out.ID = id
-	return &out, true, nil
+	return result, createdResult, nil
 }
 
 // List returns one page of complete SBOMs for an artifact ordered by ID, plus
@@ -177,76 +237,55 @@ func (s *Store) Register(ctx context.Context, in *model.SBOM) (sbom *model.SBOM,
 // through the same loadComponentsInto/loadDependenciesInto loaders that
 // Register's idempotency check uses, keeping one reconstruction rule.
 func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (items []*model.SBOM, total int, err error) {
-	c, err := s.db.Conn(ctx)
-	if err != nil {
-		return nil, 0, unavailable(err)
-	}
-	defer c.Close()
-
-	// A read transaction pins one snapshot for every SELECT below.
-	if _, err := c.ExecContext(ctx, "BEGIN"); err != nil {
-		return nil, 0, unavailable(err)
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			// Best-effort cleanup; the original error is what callers need.
-			_, _ = c.ExecContext(context.Background(), "ROLLBACK")
+	txErr := s.withTx(ctx, txDeferred, func(q preparer) error {
+		if err := q.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM sboms WHERE artifact = ?", artifact,
+		).Scan(&total); err != nil {
+			return unavailable(err)
 		}
-	}()
 
-	if err := c.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM sboms WHERE artifact = ?", artifact,
-	).Scan(&total); err != nil {
-		return nil, 0, unavailable(err)
-	}
-
-	rows, err := c.QueryContext(ctx,
-		"SELECT id, artifact, version FROM sboms WHERE artifact = ? ORDER BY id ASC LIMIT ? OFFSET ?",
-		artifact, pageSize, (page-1)*pageSize)
-	if err != nil {
-		return nil, 0, unavailable(err)
-	}
-	defer rows.Close()
-
-	items = []*model.SBOM{}
-	ids := make([]int64, 0, pageSize)
-	indexByID := make(map[int64]int, pageSize)
-	for rows.Next() {
-		sbom := &model.SBOM{Components: []model.Component{}}
-		if err := rows.Scan(&sbom.ID, &sbom.Artifact, &sbom.Version); err != nil {
-			return nil, 0, unavailable(err)
+		rows, err := q.QueryContext(ctx,
+			"SELECT id, artifact, version FROM sboms WHERE artifact = ? ORDER BY id ASC LIMIT ? OFFSET ?",
+			artifact, pageSize, (page-1)*pageSize)
+		if err != nil {
+			return unavailable(err)
 		}
-		ids = append(ids, sbom.ID)
-		indexByID[sbom.ID] = len(items)
-		items = append(items, sbom)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, unavailable(err)
-	}
+		defer rows.Close()
 
-	// Empty page (unknown artifact or a page past the last one): the count was
-	// already read, and the two detail queries must not run with an empty IN
-	// list. Total is still returned to the caller.
-	if len(ids) == 0 {
-		if _, err := c.ExecContext(ctx, "COMMIT"); err != nil {
-			return nil, 0, unavailable(err)
+		items = []*model.SBOM{}
+		ids := make([]int64, 0, pageSize)
+		indexByID := make(map[int64]int, pageSize)
+		for rows.Next() {
+			sbom := &model.SBOM{Components: []model.Component{}}
+			if err := rows.Scan(&sbom.ID, &sbom.Artifact, &sbom.Version); err != nil {
+				return unavailable(err)
+			}
+			ids = append(ids, sbom.ID)
+			indexByID[sbom.ID] = len(items)
+			items = append(items, sbom)
 		}
-		committed = true
-		return items, total, nil
-	}
+		if err := rows.Err(); err != nil {
+			return unavailable(err)
+		}
 
-	if err := loadComponentsInto(ctx, c, items, ids, indexByID); err != nil {
-		return nil, 0, err
-	}
-	if err := loadDependenciesInto(ctx, c, items, ids, indexByID); err != nil {
-		return nil, 0, err
-	}
+		// Empty page (unknown artifact or a page past the last one): the count
+		// was already read, and the two detail queries must not run with an
+		// empty IN list. Total is still returned to the caller.
+		if len(ids) == 0 {
+			return nil
+		}
 
-	if _, err := c.ExecContext(ctx, "COMMIT"); err != nil {
-		return nil, 0, unavailable(err)
+		if err := loadComponentsInto(ctx, q, items, ids, indexByID); err != nil {
+			return err
+		}
+		if err := loadDependenciesInto(ctx, q, items, ids, indexByID); err != nil {
+			return err
+		}
+		return nil
+	})
+	if txErr != nil {
+		return nil, 0, txErr
 	}
-	committed = true
 	return items, total, nil
 }
 
