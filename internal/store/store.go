@@ -289,6 +289,85 @@ func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (
 	return items, total, nil
 }
 
+// Diff loads two registered manifests of one artifact for comparison. Both
+// manifests are reconstructed inside one deferred read transaction and so
+// share one committed snapshot: the caller can never compare two versions
+// read from different commits, and neither manifest can ever be a
+// half-written registration because Register commits the sbom row and every
+// component/dependency atomically. When fromVersion and toVersion are
+// identical the manifest is read once and the same record fills both result
+// slots. A missing version yields model.ErrNotFound — still just that one
+// error when both versions are absent. Every other read failure becomes
+// model.ErrStorageUnavailable with no partial result.
+func (s *Store) Diff(ctx context.Context, artifact, fromVersion, toVersion string) (from, to *model.SBOM, err error) {
+	var fromSBOM, toSBOM *model.SBOM
+	txErr := s.withTx(ctx, txDeferred, func(q preparer) error {
+		// The unique (artifact, version) constraint makes the IN-list return
+		// at most one row per version; collapse equal versions to one slot so
+		// a self-comparison reads its manifest only once.
+		versions := []string{fromVersion, toVersion}
+		if fromVersion == toVersion {
+			versions = []string{fromVersion}
+		}
+		query := `
+SELECT id, artifact, version FROM sboms
+WHERE artifact = ? AND version IN (` + placeholders(len(versions)) + `)
+ORDER BY id ASC`
+		args := make([]any, 0, len(versions)+1)
+		args = append(args, artifact)
+		for _, version := range versions {
+			args = append(args, version)
+		}
+		rows, err := q.QueryContext(ctx, query, args...)
+		if err != nil {
+			return unavailable(err)
+		}
+		defer rows.Close()
+
+		items := []*model.SBOM{}
+		ids := make([]int64, 0, len(versions))
+		indexByID := make(map[int64]int, len(versions))
+		byVersion := make(map[string]*model.SBOM, len(versions))
+		for rows.Next() {
+			sbom := &model.SBOM{Components: []model.Component{}}
+			if err := rows.Scan(&sbom.ID, &sbom.Artifact, &sbom.Version); err != nil {
+				return unavailable(err)
+			}
+			ids = append(ids, sbom.ID)
+			indexByID[sbom.ID] = len(items)
+			items = append(items, sbom)
+			byVersion[sbom.Version] = sbom
+		}
+		if err := rows.Err(); err != nil {
+			return unavailable(err)
+		}
+
+		// Existence is settled against this snapshot before any detail read;
+		// a single not-found result is returned even when both versions miss.
+		fromSBOM = byVersion[fromVersion]
+		toSBOM = byVersion[toVersion]
+		if fromSBOM == nil || toSBOM == nil {
+			return model.ErrNotFound
+		}
+
+		// One batched read per detail table for both manifests (or the single
+		// self-comparison manifest), through the same loaders List and
+		// Register use, so components and direct dependency edges follow the
+		// one reconstruction rule.
+		if err := loadComponentsInto(ctx, q, items, ids, indexByID); err != nil {
+			return err
+		}
+		if err := loadDependenciesInto(ctx, q, items, ids, indexByID); err != nil {
+			return err
+		}
+		return nil
+	})
+	if txErr != nil {
+		return nil, nil, txErr
+	}
+	return fromSBOM, toSBOM, nil
+}
+
 // loadComponentsInto reads every component of the given manifests in one
 // query and attaches the ordered components to their manifests. It is the
 // single component reconstruction rule of the service: List calls it for the

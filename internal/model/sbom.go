@@ -31,6 +31,9 @@ var (
 	// ErrConflict signals that an SBOM with the same artifact and version
 	// already exists with different content.
 	ErrConflict = errors.New("SbomConflictError")
+	// ErrNotFound signals that the requested artifact/version is not
+	// registered. Diff returns it for either missing version.
+	ErrNotFound = errors.New("SbomNotFoundError")
 	// ErrStorageUnavailable signals that the persistence layer cannot serve
 	// the request.
 	ErrStorageUnavailable = errors.New("storage_unavailable")

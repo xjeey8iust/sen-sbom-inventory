@@ -75,6 +75,42 @@ go run .
 
 存储不可用时返回 503 `storage_unavailable`。
 
+### `GET /sboms/diff`
+
+比较同一制品已登记的两个版本。三个查询参数均为必填字符串，去除首尾空白后精确匹配、区分大小写：
+
+- `artifact`：制品标识；
+- `fromVersion`：旧版本；
+- `toVersion`：新版本。
+
+版本只作标识，接口不推断版本先后，也不要求两个版本不同。参数缺失或去空白后为空，返回 400 `InvalidSbomInputError`。参数有效但任一版本不存在（含双方都不存在），返回 404 `SbomNotFoundError`。
+
+成功返回 HTTP 200，对象只包含规范化后的三个标识字段和 `added`、`removed`、`changed`：
+
+- `added`：仅存在于新版本的完整组件；`removed`：仅存在于旧版本的完整组件；组件结构与登记响应一致（`coordinate`、`license`、`dependencies`，空依赖为 `[]`）；
+- 相同坐标仅当 `license` 或直接依赖坐标集合改变时才进入 `changed`，每项含 `coordinate` 以及来自旧、新清单的完整组件 `before`、`after`；
+- 坐标改名算一条 `removed` 加一条 `added`，不进入 `changed`；未变化组件不输出；
+- 依赖只比较直接关系，不展开传递依赖，依赖目标的许可证变化也不传播给引用它的组件；
+- 三个数组始终是数组（无差异为 `[]`，不返回 `null`），并按坐标字符串升序；组件内依赖保持既有排序；比较结果与登记时的数组顺序无关。
+
+```json
+{
+  "artifact": "app",
+  "fromVersion": "1.0.0",
+  "toVersion": "2.0.0",
+  "added": [{"coordinate":"lib-new","license":"MIT","dependencies":[]}],
+  "removed": [{"coordinate":"lib-old","license":"MIT","dependencies":[]}],
+  "changed": [
+    {"coordinate":"lib-a","before":{"coordinate":"lib-a","license":"GPL-2.0","dependencies":[]},
+     "after":{"coordinate":"lib-a","license":"GPL-3.0","dependencies":[]}}
+  ]
+}
+```
+
+同版本与自身比较（`fromVersion` 与 `toVersion` 相同）时，只要清单存在，就返回三个空数组。空清单以及允许的非自身依赖环遵循同一比较规则。
+
+两份清单在同一个只读事务、同一个已提交数据快照中读取，因此不会读到半写入清单；任一读取失败返回 503 `storage_unavailable`，不返回部分差异。
+
 ## 错误约定
 
 所有错误响应都是单个顶层 `error` 对象，包含 `code` 与 `message` 两个字符串字段；`message` 不包含 SQL、堆栈或文件路径。

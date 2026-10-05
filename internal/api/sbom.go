@@ -233,9 +233,11 @@ func positiveQuery(c *gin.Context, name string, fallback int) (int, error) {
 const (
 	invalidInputCode    = "InvalidSbomInputError"
 	conflictCode        = "SbomConflictError"
+	notFoundCode        = "SbomNotFoundError"
 	storageCode         = "storage_unavailable"
 	invalidInputMessage = "request is not a valid SBOM manifest"
 	conflictMessage     = "an SBOM with different content already exists for this artifact and version"
+	notFoundMessage     = "no SBOM is registered for this artifact and version"
 	storageMessage      = "database is not available"
 )
 
@@ -249,6 +251,8 @@ func writeStoreError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, model.ErrConflict):
 		writeAPIError(c, http.StatusConflict, conflictCode, conflictMessage)
+	case errors.Is(err, model.ErrNotFound):
+		writeAPIError(c, http.StatusNotFound, notFoundCode, notFoundMessage)
 	case errors.Is(err, model.ErrStorageUnavailable):
 		writeAPIError(c, http.StatusServiceUnavailable, storageCode, storageMessage)
 	default:
