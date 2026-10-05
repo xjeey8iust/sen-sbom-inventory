@@ -19,6 +19,12 @@ type Store struct {
 
 // Open prepares the database file and the schema this service needs.
 func Open(path string) (*Store, error) {
+	return open(path, "sqlite")
+}
+
+// open is Open with an injectable driver name, which lets the package tests
+// register a driver wrapper around the real SQLite driver.
+func open(path, driverName string) (*Store, error) {
 	dsn := path
 	if strings.Contains(dsn, "?") {
 		dsn += "&"
@@ -30,7 +36,7 @@ func Open(path string) (*Store, error) {
 	// failing immediately with SQLITE_BUSY.
 	dsn += "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -163,23 +169,38 @@ func (s *Store) Register(ctx context.Context, in *model.SBOM) (sbom *model.SBOM,
 }
 
 // List returns one page of complete SBOMs for an artifact ordered by ID, plus
-// the total number of matching manifests. Both reads run in one transaction so
-// the count and the page share the same snapshot.
+// the total number of matching manifests. The count, the page manifests and
+// the components/dependencies of that page are each read in one batched query
+// (four SELECTs at most, regardless of page size) inside one transaction, so
+// the total and the details share one committed snapshot and detail rows are
+// never fetched for other pages or other artifacts.
 func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (items []*model.SBOM, total int, err error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	c, err := s.db.Conn(ctx)
 	if err != nil {
 		return nil, 0, unavailable(err)
 	}
-	defer tx.Rollback()
+	defer c.Close()
 
-	if err := tx.QueryRowContext(ctx,
+	// A read transaction pins one snapshot for every SELECT below.
+	if _, err := c.ExecContext(ctx, "BEGIN"); err != nil {
+		return nil, 0, unavailable(err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			// Best-effort cleanup; the original error is what callers need.
+			_, _ = c.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	if err := c.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM sboms WHERE artifact = ?", artifact,
 	).Scan(&total); err != nil {
 		return nil, 0, unavailable(err)
 	}
 
-	rows, err := tx.QueryContext(ctx,
-		"SELECT id FROM sboms WHERE artifact = ? ORDER BY id ASC LIMIT ? OFFSET ?",
+	rows, err := c.QueryContext(ctx,
+		"SELECT id, artifact, version FROM sboms WHERE artifact = ? ORDER BY id ASC LIMIT ? OFFSET ?",
 		artifact, pageSize, (page-1)*pageSize)
 	if err != nil {
 		return nil, 0, unavailable(err)
@@ -187,28 +208,139 @@ func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (
 	defer rows.Close()
 
 	items = []*model.SBOM{}
+	ids := make([]int64, 0, pageSize)
+	indexByID := make(map[int64]int, pageSize)
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+		sbom := &model.SBOM{Components: []model.Component{}}
+		if err := rows.Scan(&sbom.ID, &sbom.Artifact, &sbom.Version); err != nil {
 			return nil, 0, unavailable(err)
 		}
-		sbom, err := loadSBOM(ctx, tx, id)
-		if err != nil {
-			return nil, 0, err
-		}
+		ids = append(ids, sbom.ID)
+		indexByID[sbom.ID] = len(items)
 		items = append(items, sbom)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, unavailable(err)
 	}
-	if err := tx.Commit(); err != nil {
+
+	// Empty page (unknown artifact or a page past the last one): the count was
+	// already read, and the two detail queries must not run with an empty IN
+	// list. Total is still returned to the caller.
+	if len(ids) == 0 {
+		if _, err := c.ExecContext(ctx, "COMMIT"); err != nil {
+			return nil, 0, unavailable(err)
+		}
+		committed = true
+		return items, total, nil
+	}
+
+	if err := loadPageComponents(ctx, c, items, ids, indexByID); err != nil {
+		return nil, 0, err
+	}
+	if err := loadPageDependencies(ctx, c, items, ids, indexByID); err != nil {
+		return nil, 0, err
+	}
+
+	if _, err := c.ExecContext(ctx, "COMMIT"); err != nil {
 		return nil, 0, unavailable(err)
 	}
+	committed = true
 	return items, total, nil
 }
 
-// loadSBOM reconstructs a full manifest with components ordered by coordinate
-// and each component's dependencies ordered by the target coordinate.
+// loadPageComponents reads every component of the current page in one query
+// and attaches the ordered components to their manifests.
+func loadPageComponents(ctx context.Context, q queryer, items []*model.SBOM, ids []int64, indexByID map[int64]int) error {
+	query := `
+SELECT c.sbom_id, c.coordinate, c.license
+FROM components c
+WHERE c.sbom_id IN (` + placeholders(len(ids)) + `)
+ORDER BY c.sbom_id ASC, c.coordinate ASC`
+	args := int64Args(ids)
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return unavailable(err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sbomID int64
+		var comp model.Component
+		comp.Dependencies = []string{}
+		if err := rows.Scan(&sbomID, &comp.Coordinate, &comp.License); err != nil {
+			return unavailable(err)
+		}
+		items[indexByID[sbomID]].Components = append(items[indexByID[sbomID]].Components, comp)
+	}
+	return rowsError(rows.Err())
+}
+
+// loadPageDependencies reads every dependency edge of the current page in one
+// query. Both endpoints belong to the same manifest: the JOIN on sbom_id keeps
+// edges scoped to the page and also prevents a target row from another version
+// ever matching when coordinates repeat across versions.
+func loadPageDependencies(ctx context.Context, q queryer, items []*model.SBOM, ids []int64, indexByID map[int64]int) error {
+	query := `
+SELECT sc.sbom_id, sc.coordinate, tc.coordinate
+FROM dependencies d
+JOIN components sc ON sc.id = d.component_id
+JOIN components tc ON tc.id = d.target_id AND tc.sbom_id = sc.sbom_id
+WHERE sc.sbom_id IN (` + placeholders(len(ids)) + `)
+ORDER BY sc.sbom_id ASC, sc.coordinate ASC, tc.coordinate ASC`
+	rows, err := q.QueryContext(ctx, query, int64Args(ids)...)
+	if err != nil {
+		return unavailable(err)
+	}
+	defer rows.Close()
+
+	// Coordinates are unique within a manifest, so a (sbom ID, coordinate) pair
+	// locates the owning component even when two versions share a coordinate.
+	coordinateIndex := make(map[int64]map[string]int, len(items))
+	for _, sbom := range items {
+		byCoordinate := make(map[string]int, len(sbom.Components))
+		for j := range sbom.Components {
+			byCoordinate[sbom.Components[j].Coordinate] = j
+		}
+		coordinateIndex[sbom.ID] = byCoordinate
+	}
+
+	for rows.Next() {
+		var sbomID int64
+		var from, to string
+		if err := rows.Scan(&sbomID, &from, &to); err != nil {
+			return unavailable(err)
+		}
+		comp := &items[indexByID[sbomID]].Components[coordinateIndex[sbomID][from]]
+		comp.Dependencies = append(comp.Dependencies, to)
+	}
+	return rowsError(rows.Err())
+}
+
+// rowsError maps a drained cursor's terminal error without wrapping nil.
+func rowsError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return unavailable(err)
+}
+
+// placeholders builds "?,?,?" for an IN-list of n values.
+func placeholders(n int) string {
+	return strings.Repeat("?,", n-1) + "?"
+}
+
+func int64Args(ids []int64) []any {
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	return args
+}
+
+// loadSBOM reconstructs a single manifest with components ordered by
+// coordinate and each component's dependencies ordered by the target
+// coordinate. It is used by Register's idempotency/conflict check only; List
+// takes the batched loaders above to stay within four SELECTs per page.
 func loadSBOM(ctx context.Context, q queryer, id int64) (*model.SBOM, error) {
 	sbom := &model.SBOM{ID: id, Components: []model.Component{}}
 	if err := q.QueryRowContext(ctx,
@@ -242,7 +374,7 @@ func loadSBOM(ctx context.Context, q queryer, id int64) (*model.SBOM, error) {
 SELECT sc.coordinate, tc.coordinate
 FROM dependencies d
 JOIN components sc ON sc.id = d.component_id
-JOIN components tc ON tc.id = d.target_id
+JOIN components tc ON tc.id = d.target_id AND tc.sbom_id = sc.sbom_id
 WHERE sc.sbom_id = ?
 ORDER BY sc.coordinate ASC, tc.coordinate ASC`, id)
 	if err != nil {
