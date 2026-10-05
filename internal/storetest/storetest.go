@@ -36,6 +36,8 @@ type Driver struct {
 	}
 	// failKind, when non-empty, makes the next SELECT of that kind fail.
 	failKind string
+	// failWriteKind, when non-empty, makes INSERTs of that kind fail.
+	failWriteKind string
 }
 
 // DriverName is the database/sql name under which the counting driver is
@@ -65,6 +67,7 @@ func (d *Driver) Reset() {
 	d.stats.selects = 0
 	d.stats.rowsByKind = map[string]int{}
 	d.failKind = ""
+	d.failWriteKind = ""
 	d.mu.Unlock()
 }
 
@@ -75,6 +78,23 @@ func (d *Driver) FailNextRead(kind string) {
 	d.mu.Lock()
 	d.failKind = kind
 	d.mu.Unlock()
+}
+
+// FailNextWrite makes INSERTs into the given table
+// ("sboms"/"components"/"dependencies") fail at the driver, simulating a
+// storage write error. The fault stays armed until Reset, whether the
+// statement runs through a direct Exec or a prepared statement.
+func (d *Driver) FailNextWrite(kind string) {
+	d.mu.Lock()
+	d.failWriteKind = kind
+	d.mu.Unlock()
+}
+
+// writeFaultPending reports whether an INSERT of the given kind must fail.
+func (d *Driver) writeFaultPending(kind string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return kind != "" && d.failWriteKind == kind
 }
 
 // Snapshot returns a point-in-time copy of the counters.
@@ -105,7 +125,35 @@ type countingConn struct {
 }
 
 func (c *countingConn) Exec(query string, args []driver.Value) (driver.Result, error) {
+	if c.driver.writeFaultPending(WriteKind(query)) {
+		return nil, errors.New("forced write failure from test driver")
+	}
 	return c.Conn.(driver.Execer).Exec(query, args)
+}
+
+// Prepare wraps the inner statement so INSERTs issued through prepared
+// statements (the store's component and dependency detail writes) observe the
+// same injected write faults as direct Exec calls.
+func (c *countingConn) Prepare(query string) (driver.Stmt, error) {
+	stmt, err := c.Conn.Prepare(query)
+	if err != nil {
+		return nil, err
+	}
+	return &countingStmt{Stmt: stmt, driver: c.driver, kind: WriteKind(query)}, nil
+}
+
+// countingStmt intercepts Exec on prepared INSERT statements.
+type countingStmt struct {
+	driver.Stmt
+	driver *Driver
+	kind   string
+}
+
+func (s *countingStmt) Exec(args []driver.Value) (driver.Result, error) {
+	if s.driver.writeFaultPending(s.kind) {
+		return nil, errors.New("forced write failure from test driver")
+	}
+	return s.Stmt.Exec(args)
 }
 
 // ResetSession and IsValid delegate the optional driver interfaces so pooled
@@ -173,6 +221,23 @@ func SelectKind(query string) string {
 	case strings.Contains(s, "FROM COMPONENTS C"):
 		return "components"
 	case strings.Contains(s, "FROM DEPENDENCIES D"):
+		return "dependencies"
+	default:
+		return "sboms"
+	}
+}
+
+// WriteKind classifies the store's INSERT statements by target table;
+// anything else returns the empty string.
+func WriteKind(query string) string {
+	s := strings.ToUpper(strings.TrimSpace(query))
+	if !strings.HasPrefix(s, "INSERT") {
+		return ""
+	}
+	switch {
+	case strings.Contains(s, "INTO COMPONENTS"):
+		return "components"
+	case strings.Contains(s, "INTO DEPENDENCIES"):
 		return "dependencies"
 	default:
 		return "sboms"

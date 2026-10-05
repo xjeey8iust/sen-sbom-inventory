@@ -103,3 +103,59 @@ func TestRegisterReadFailureReturnsUnavailable(t *testing.T) {
 		})
 	}
 }
+
+// TestRegisterWriteFailureReturnsUnavailable forces a failure on each detail
+// insert (components, then dependencies). Every failure must surface as
+// model.ErrStorageUnavailable, leave no partial records behind, and keep the
+// pre-existing manifests intact; once the fault clears, registrations and
+// queries must complete normally again.
+func TestRegisterWriteFailureReturnsUnavailable(t *testing.T) {
+	for _, kind := range []string{"components", "dependencies"} {
+		t.Run(kind, func(t *testing.T) {
+			st, counted := openCountingStore(t)
+			ctx := context.Background()
+			kept := registerManifest(t, st, "app", "keep", twoComponents([]string{"b"}))
+
+			detail := []model.Component{
+				{Coordinate: "a", License: "L-a", Dependencies: []string{"b"}},
+				{Coordinate: "b", License: "L-b", Dependencies: []string{}},
+			}
+			counted.FailNextWrite(kind)
+			_, _, err := st.Register(ctx, &model.SBOM{
+				Artifact: "app", Version: "1", Components: detail,
+			})
+			if err == nil {
+				t.Fatalf("expected failure on %s write", kind)
+			}
+			if !errors.Is(err, model.ErrStorageUnavailable) {
+				t.Fatalf("error = %v, want model.ErrStorageUnavailable", err)
+			}
+
+			// Fault cleared: the failed registration must not be queryable and
+			// the pre-existing manifest must be complete.
+			counted.Reset()
+			items, total, err := st.List(ctx, "app", 1, 20)
+			if err != nil {
+				t.Fatalf("list after failed register: %v", err)
+			}
+			if total != 1 || len(items) != 1 {
+				t.Fatalf("total/items after failed register = %d/%d, want 1/1", total, len(items))
+			}
+			assertSameManifest(t, kept, items[0])
+
+			// Retrying the failed registration now succeeds as a new record.
+			got, created, err := st.Register(ctx, &model.SBOM{
+				Artifact: "app", Version: "1", Components: detail,
+			})
+			if err != nil {
+				t.Fatalf("register after fault cleared: %v", err)
+			}
+			if !created {
+				t.Fatalf("register after fault cleared: not created")
+			}
+			assertSameManifest(t, got, &model.SBOM{
+				ID: got.ID, Artifact: "app", Version: "1", Components: detail,
+			})
+		})
+	}
+}
