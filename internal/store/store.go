@@ -173,7 +173,9 @@ func (s *Store) Register(ctx context.Context, in *model.SBOM) (sbom *model.SBOM,
 // the components/dependencies of that page are each read in one batched query
 // (four SELECTs at most, regardless of page size) inside one transaction, so
 // the total and the details share one committed snapshot and detail rows are
-// never fetched for other pages or other artifacts.
+// never fetched for other pages or other artifacts. The detail reads go
+// through the same loadComponentsInto/loadDependenciesInto loaders that
+// Register's idempotency check uses, keeping one reconstruction rule.
 func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (items []*model.SBOM, total int, err error) {
 	c, err := s.db.Conn(ctx)
 	if err != nil {
@@ -234,10 +236,10 @@ func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (
 		return items, total, nil
 	}
 
-	if err := loadPageComponents(ctx, c, items, ids, indexByID); err != nil {
+	if err := loadComponentsInto(ctx, c, items, ids, indexByID); err != nil {
 		return nil, 0, err
 	}
-	if err := loadPageDependencies(ctx, c, items, ids, indexByID); err != nil {
+	if err := loadDependenciesInto(ctx, c, items, ids, indexByID); err != nil {
 		return nil, 0, err
 	}
 
@@ -248,9 +250,13 @@ func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (
 	return items, total, nil
 }
 
-// loadPageComponents reads every component of the current page in one query
-// and attaches the ordered components to their manifests.
-func loadPageComponents(ctx context.Context, q queryer, items []*model.SBOM, ids []int64, indexByID map[int64]int) error {
+// loadComponentsInto reads every component of the given manifests in one
+// query and attaches the ordered components to their manifests. It is the
+// single component reconstruction rule of the service: List calls it for the
+// current page, and Register's idempotency/conflict check calls it (through
+// loadSBOM) for the one stored manifest, so both read paths rebuild
+// components exactly the same way.
+func loadComponentsInto(ctx context.Context, q queryer, items []*model.SBOM, ids []int64, indexByID map[int64]int) error {
 	query := `
 SELECT c.sbom_id, c.coordinate, c.license
 FROM components c
@@ -275,11 +281,13 @@ ORDER BY c.sbom_id ASC, c.coordinate ASC`
 	return rowsError(rows.Err())
 }
 
-// loadPageDependencies reads every dependency edge of the current page in one
-// query. Both endpoints belong to the same manifest: the JOIN on sbom_id keeps
-// edges scoped to the page and also prevents a target row from another version
-// ever matching when coordinates repeat across versions.
-func loadPageDependencies(ctx context.Context, q queryer, items []*model.SBOM, ids []int64, indexByID map[int64]int) error {
+// loadDependenciesInto reads every dependency edge of the given manifests in
+// one query. Both endpoints belong to the same manifest: the JOIN on sbom_id
+// keeps edges scoped to the given manifests and also prevents a target row
+// from another version ever matching when coordinates repeat across versions.
+// Like loadComponentsInto it is shared by List (for a page) and by Register's
+// idempotency/conflict check (through loadSBOM, for a single manifest).
+func loadDependenciesInto(ctx context.Context, q queryer, items []*model.SBOM, ids []int64, indexByID map[int64]int) error {
 	query := `
 SELECT sc.sbom_id, sc.coordinate, tc.coordinate
 FROM dependencies d
@@ -337,10 +345,11 @@ func int64Args(ids []int64) []any {
 	return args
 }
 
-// loadSBOM reconstructs a single manifest with components ordered by
-// coordinate and each component's dependencies ordered by the target
-// coordinate. It is used by Register's idempotency/conflict check only; List
-// takes the batched loaders above to stay within four SELECTs per page.
+// loadSBOM reconstructs a single stored manifest for Register's
+// idempotency/conflict check. It reads the manifest row itself, then rebuilds
+// components and dependencies through the same loaders List applies to a
+// page, so the registration read path and the paged read path share one
+// reconstruction rule by construction.
 func loadSBOM(ctx context.Context, q queryer, id int64) (*model.SBOM, error) {
 	sbom := &model.SBOM{ID: id, Components: []model.Component{}}
 	if err := q.QueryRowContext(ctx,
@@ -349,49 +358,16 @@ func loadSBOM(ctx context.Context, q queryer, id int64) (*model.SBOM, error) {
 		return nil, unavailable(err)
 	}
 
-	componentRows, err := q.QueryContext(ctx,
-		"SELECT coordinate, license FROM components WHERE sbom_id = ? ORDER BY coordinate ASC", id)
-	if err != nil {
-		return nil, unavailable(err)
+	// A one-manifest page: the shared loaders keep the component and
+	// dependency ordering/scoping rules identical to List's paged reads.
+	items := []*model.SBOM{sbom}
+	ids := []int64{id}
+	indexByID := map[int64]int{id: 0}
+	if err := loadComponentsInto(ctx, q, items, ids, indexByID); err != nil {
+		return nil, err
 	}
-	defer componentRows.Close()
-
-	indexByCoordinate := make(map[string]int)
-	for componentRows.Next() {
-		var comp model.Component
-		comp.Dependencies = []string{}
-		if err := componentRows.Scan(&comp.Coordinate, &comp.License); err != nil {
-			return nil, unavailable(err)
-		}
-		indexByCoordinate[comp.Coordinate] = len(sbom.Components)
-		sbom.Components = append(sbom.Components, comp)
-	}
-	if err := componentRows.Err(); err != nil {
-		return nil, unavailable(err)
-	}
-
-	depRows, err := q.QueryContext(ctx, `
-SELECT sc.coordinate, tc.coordinate
-FROM dependencies d
-JOIN components sc ON sc.id = d.component_id
-JOIN components tc ON tc.id = d.target_id AND tc.sbom_id = sc.sbom_id
-WHERE sc.sbom_id = ?
-ORDER BY sc.coordinate ASC, tc.coordinate ASC`, id)
-	if err != nil {
-		return nil, unavailable(err)
-	}
-	defer depRows.Close()
-
-	for depRows.Next() {
-		var from, to string
-		if err := depRows.Scan(&from, &to); err != nil {
-			return nil, unavailable(err)
-		}
-		comp := &sbom.Components[indexByCoordinate[from]]
-		comp.Dependencies = append(comp.Dependencies, to)
-	}
-	if err := depRows.Err(); err != nil {
-		return nil, unavailable(err)
+	if err := loadDependenciesInto(ctx, q, items, ids, indexByID); err != nil {
+		return nil, err
 	}
 	return sbom, nil
 }

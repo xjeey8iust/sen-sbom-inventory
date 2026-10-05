@@ -218,6 +218,56 @@ func TestRegisterIsIdempotentRegardlessOfOrder(t *testing.T) {
 	assertSBOMEqual(t, &repeated, &original)
 }
 
+// TestReplayAndListReturnIdenticalManifest registers a manifest, replays it
+// with shuffled arrays and padding, then reads it back through GET /sboms:
+// all three responses must carry the same record, proving the registration
+// read path and the paged read path reconstruct manifests identically.
+func TestReplayAndListReturnIdenticalManifest(t *testing.T) {
+	router, _ := newTestRouter(t)
+
+	first := `{"artifact":"app","version":"1","components":[
+		{"coordinate":"a","license":"Apache-2.0","dependencies":["b","c"]},
+		{"coordinate":"b","license":"MIT","dependencies":["a"]},
+		{"coordinate":"c","license":"BSD-3-Clause","dependencies":[]}
+	]}`
+	rec := postSBOM(t, router, first)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("register: %d %s", rec.Code, rec.Body.String())
+	}
+	var created model.SBOM
+	decodeBody(t, rec, &created)
+
+	replay := `{"artifact":" app ","version":" 1 ","components":[
+		{"coordinate":"c","license":" BSD-3-Clause ","dependencies":[]},
+		{"coordinate":"a","license":"Apache-2.0","dependencies":["c","b"]},
+		{"coordinate":"b","license":"MIT","dependencies":["a"]}
+	]}`
+	rec = postSBOM(t, router, replay)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("replay: %d %s", rec.Code, rec.Body.String())
+	}
+	var replayed model.SBOM
+	decodeBody(t, rec, &replayed)
+	if replayed.ID != created.ID {
+		t.Fatalf("replay id = %d, want %d", replayed.ID, created.ID)
+	}
+	assertSBOMEqual(t, &replayed, &created)
+
+	rec = getSBOMs(t, router, "/sboms?artifact=app")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list: %d %s", rec.Code, rec.Body.String())
+	}
+	var page listResponse
+	decodeBody(t, rec, &page)
+	if page.Total != 1 || len(page.Items) != 1 {
+		t.Fatalf("page = total %d items %d, want 1/1", page.Total, len(page.Items))
+	}
+	if page.Items[0].ID != created.ID {
+		t.Fatalf("listed id = %d, want %d", page.Items[0].ID, created.ID)
+	}
+	assertSBOMEqual(t, page.Items[0], &created)
+}
+
 func TestRegisterConflictLeavesOriginalUntouched(t *testing.T) {
 	changed := []string{
 		// Different license.
