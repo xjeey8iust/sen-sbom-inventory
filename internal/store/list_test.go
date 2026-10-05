@@ -323,6 +323,85 @@ func sameStrings(a, b []string) bool {
 	return true
 }
 
+// TestRegisterReplayMatchesListReconstruction proves the two manifest read
+// paths — Register's idempotent replay (loadSBOM) and List's batched page
+// assembly — rebuild identical manifests from the same rows: the register
+// response, the replayed record and the listed page item all agree, including
+// empty arrays and a dependency cycle.
+func TestRegisterReplayMatchesListReconstruction(t *testing.T) {
+	st, _ := openCountingStore(t)
+	ctx := context.Background()
+
+	manifests := map[string][]model.Component{
+		"1": {
+			{Coordinate: "a", License: "A", Dependencies: []string{"b", "c"}},
+			{Coordinate: "b", License: "B", Dependencies: []string{"c"}},
+			{Coordinate: "c", License: "C", Dependencies: []string{}},
+		},
+		"cycle": {
+			{Coordinate: "x", License: "X", Dependencies: []string{"y"}},
+			{Coordinate: "y", License: "Y", Dependencies: []string{"x"}},
+		},
+		"empty": {},
+	}
+	created := make(map[string]*model.SBOM, len(manifests))
+	for version, comps := range manifests {
+		created[version] = registerManifest(t, st, "app", version, comps)
+	}
+
+	items, total, err := st.List(ctx, "app", 1, 20)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if total != len(manifests) || len(items) != len(manifests) {
+		t.Fatalf("total/items = %d/%d, want %d/%d", total, len(items), len(manifests), len(manifests))
+	}
+	listed := make(map[string]*model.SBOM, len(items))
+	for _, item := range items {
+		listed[item.Version] = item
+	}
+
+	for version, comps := range manifests {
+		// Replay the same content: the store reloads the persisted manifest
+		// through loadSBOM and must return the original record unchanged.
+		replay, wasCreated, err := st.Register(ctx, &model.SBOM{
+			Artifact: "app", Version: version, Components: comps,
+		})
+		if err != nil {
+			t.Fatalf("replay %s: %v", version, err)
+		}
+		if wasCreated {
+			t.Fatalf("replay of %s created a new record", version)
+		}
+		assertSameManifest(t, replay, created[version])
+		assertSameManifest(t, listed[version], created[version])
+		assertSameManifest(t, replay, listed[version])
+	}
+}
+
+// assertSameManifest requires two reconstructed manifests to agree on
+// identity, components, licenses and dependency edges, with empty arrays
+// present rather than nil.
+func assertSameManifest(t *testing.T, got, want *model.SBOM) {
+	t.Helper()
+	if got.ID != want.ID || got.Artifact != want.Artifact || got.Version != want.Version {
+		t.Fatalf("identity = %d/%s/%s, want %d/%s/%s",
+			got.ID, got.Artifact, got.Version, want.ID, want.Artifact, want.Version)
+	}
+	if got.Components == nil || len(got.Components) != len(want.Components) {
+		t.Fatalf("components = %+v, want %d entries (non-nil)", got.Components, len(want.Components))
+	}
+	for i := range want.Components {
+		g, w := got.Components[i], want.Components[i]
+		if g.Coordinate != w.Coordinate || g.License != w.License {
+			t.Fatalf("component %d = %+v, want %+v", i, g, w)
+		}
+		if g.Dependencies == nil || !sameStrings(g.Dependencies, w.Dependencies) {
+			t.Fatalf("deps of %s = %v, want %v (non-nil)", g.Coordinate, g.Dependencies, w.Dependencies)
+		}
+	}
+}
+
 // TestListReadFailuresReturnUnavailable forces a failure at each of the four
 // read steps. Every failure must surface model.ErrStorageUnavailable with no
 // partial items.

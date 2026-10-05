@@ -218,6 +218,39 @@ func TestRegisterIsIdempotentRegardlessOfOrder(t *testing.T) {
 	assertSBOMEqual(t, &repeated, &original)
 }
 
+// TestRegisterResponseMatchesListedManifest posts a manifest and requires the
+// exact same document back from the corresponding GET /sboms page, proving
+// the registration read path and the paginated read path reconstruct the same
+// manifest.
+func TestRegisterResponseMatchesListedManifest(t *testing.T) {
+	router, _ := newTestRouter(t)
+	body := `{"artifact":"app","version":"1","components":[
+		{"coordinate":"a","license":"A","dependencies":["b","c"]},
+		{"coordinate":"b","license":"B","dependencies":["c"]},
+		{"coordinate":"c","license":"C","dependencies":[]}
+	]}`
+	rec := postSBOM(t, router, body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("register: %d %s", rec.Code, rec.Body.String())
+	}
+	var posted model.SBOM
+	decodeBody(t, rec, &posted)
+
+	rec = getSBOMs(t, router, "/sboms?artifact=app")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list: %d %s", rec.Code, rec.Body.String())
+	}
+	var page listResponse
+	decodeBody(t, rec, &page)
+	if page.Total != 1 || len(page.Items) != 1 {
+		t.Fatalf("page = total %d items %d, want 1/1", page.Total, len(page.Items))
+	}
+	assertSBOMEqual(t, page.Items[0], &posted)
+	if page.Items[0].ID != posted.ID {
+		t.Fatalf("listed id = %d, want registered id %d", page.Items[0].ID, posted.ID)
+	}
+}
+
 func TestRegisterConflictLeavesOriginalUntouched(t *testing.T) {
 	changed := []string{
 		// Different license.

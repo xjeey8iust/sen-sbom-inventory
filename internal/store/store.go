@@ -208,36 +208,25 @@ func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (
 	defer rows.Close()
 
 	items = []*model.SBOM{}
-	ids := make([]int64, 0, pageSize)
-	indexByID := make(map[int64]int, pageSize)
 	for rows.Next() {
 		sbom := &model.SBOM{Components: []model.Component{}}
 		if err := rows.Scan(&sbom.ID, &sbom.Artifact, &sbom.Version); err != nil {
 			return nil, 0, unavailable(err)
 		}
-		ids = append(ids, sbom.ID)
-		indexByID[sbom.ID] = len(items)
 		items = append(items, sbom)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, unavailable(err)
 	}
 
-	// Empty page (unknown artifact or a page past the last one): the count was
-	// already read, and the two detail queries must not run with an empty IN
-	// list. Total is still returned to the caller.
-	if len(ids) == 0 {
-		if _, err := c.ExecContext(ctx, "COMMIT"); err != nil {
-			return nil, 0, unavailable(err)
-		}
-		committed = true
-		return items, total, nil
-	}
-
-	if err := loadPageComponents(ctx, c, items, ids, indexByID); err != nil {
+	// Rebuild the components and dependencies of this page through the shared
+	// reconstruction rules. On an empty page (unknown artifact or a page past
+	// the last one) both helpers no-op, so an empty page costs only the two
+	// SELECTs above and never runs a detail query with an empty IN list.
+	if err := attachComponents(ctx, c, items); err != nil {
 		return nil, 0, err
 	}
-	if err := loadPageDependencies(ctx, c, items, ids, indexByID); err != nil {
+	if err := attachDependencies(ctx, c, items); err != nil {
 		return nil, 0, err
 	}
 
@@ -248,21 +237,28 @@ func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (
 	return items, total, nil
 }
 
-// loadPageComponents reads every component of the current page in one query
-// and attaches the ordered components to their manifests.
-func loadPageComponents(ctx context.Context, q queryer, items []*model.SBOM, ids []int64, indexByID map[int64]int) error {
+// attachComponents reads every component of the given manifests in a single
+// query and attaches them ordered by coordinate. It is one half of the
+// reconstruction rule shared by both read paths: List calls it for the whole
+// page and Register's reload (loadSBOM) calls it for a one-manifest slice, so
+// a manifest can never read back differently depending on the path. An empty
+// slice costs no query at all.
+func attachComponents(ctx context.Context, q queryer, items []*model.SBOM) error {
+	if len(items) == 0 {
+		return nil
+	}
 	query := `
 SELECT c.sbom_id, c.coordinate, c.license
 FROM components c
-WHERE c.sbom_id IN (` + placeholders(len(ids)) + `)
+WHERE c.sbom_id IN (` + placeholders(len(items)) + `)
 ORDER BY c.sbom_id ASC, c.coordinate ASC`
-	args := int64Args(ids)
-	rows, err := q.QueryContext(ctx, query, args...)
+	rows, err := q.QueryContext(ctx, query, idArgs(items)...)
 	if err != nil {
 		return unavailable(err)
 	}
 	defer rows.Close()
 
+	position := positionByID(items)
 	for rows.Next() {
 		var sbomID int64
 		var comp model.Component
@@ -270,29 +266,37 @@ ORDER BY c.sbom_id ASC, c.coordinate ASC`
 		if err := rows.Scan(&sbomID, &comp.Coordinate, &comp.License); err != nil {
 			return unavailable(err)
 		}
-		items[indexByID[sbomID]].Components = append(items[indexByID[sbomID]].Components, comp)
+		owner := items[position[sbomID]]
+		owner.Components = append(owner.Components, comp)
 	}
 	return rowsError(rows.Err())
 }
 
-// loadPageDependencies reads every dependency edge of the current page in one
-// query. Both endpoints belong to the same manifest: the JOIN on sbom_id keeps
-// edges scoped to the page and also prevents a target row from another version
-// ever matching when coordinates repeat across versions.
-func loadPageDependencies(ctx context.Context, q queryer, items []*model.SBOM, ids []int64, indexByID map[int64]int) error {
+// attachDependencies reads every dependency edge of the given manifests in one
+// query and attaches each target coordinate to its owning component, ordered
+// by source and target coordinate. It is the other half of the shared
+// reconstruction rule (see attachComponents). Both endpoints belong to the
+// same manifest: the JOIN on sbom_id keeps edges scoped to the listed
+// manifests and also prevents a target row from another version ever matching
+// when coordinates repeat across versions. An empty slice costs no query.
+func attachDependencies(ctx context.Context, q queryer, items []*model.SBOM) error {
+	if len(items) == 0 {
+		return nil
+	}
 	query := `
 SELECT sc.sbom_id, sc.coordinate, tc.coordinate
 FROM dependencies d
 JOIN components sc ON sc.id = d.component_id
 JOIN components tc ON tc.id = d.target_id AND tc.sbom_id = sc.sbom_id
-WHERE sc.sbom_id IN (` + placeholders(len(ids)) + `)
+WHERE sc.sbom_id IN (` + placeholders(len(items)) + `)
 ORDER BY sc.sbom_id ASC, sc.coordinate ASC, tc.coordinate ASC`
-	rows, err := q.QueryContext(ctx, query, int64Args(ids)...)
+	rows, err := q.QueryContext(ctx, query, idArgs(items)...)
 	if err != nil {
 		return unavailable(err)
 	}
 	defer rows.Close()
 
+	position := positionByID(items)
 	// Coordinates are unique within a manifest, so a (sbom ID, coordinate) pair
 	// locates the owning component even when two versions share a coordinate.
 	coordinateIndex := make(map[int64]map[string]int, len(items))
@@ -310,7 +314,7 @@ ORDER BY sc.sbom_id ASC, sc.coordinate ASC, tc.coordinate ASC`
 		if err := rows.Scan(&sbomID, &from, &to); err != nil {
 			return unavailable(err)
 		}
-		comp := &items[indexByID[sbomID]].Components[coordinateIndex[sbomID][from]]
+		comp := &items[position[sbomID]].Components[coordinateIndex[sbomID][from]]
 		comp.Dependencies = append(comp.Dependencies, to)
 	}
 	return rowsError(rows.Err())
@@ -329,18 +333,30 @@ func placeholders(n int) string {
 	return strings.Repeat("?,", n-1) + "?"
 }
 
-func int64Args(ids []int64) []any {
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		args[i] = id
+// idArgs packs the IDs of the given manifests as query arguments for an
+// IN-list, in list order.
+func idArgs(items []*model.SBOM) []any {
+	args := make([]any, len(items))
+	for i, sbom := range items {
+		args[i] = sbom.ID
 	}
 	return args
 }
 
-// loadSBOM reconstructs a single manifest with components ordered by
-// coordinate and each component's dependencies ordered by the target
-// coordinate. It is used by Register's idempotency/conflict check only; List
-// takes the batched loaders above to stay within four SELECTs per page.
+// positionByID maps each manifest's ID to its slot in items, so a scanned
+// detail row finds its owning manifest without a scan of the slice.
+func positionByID(items []*model.SBOM) map[int64]int {
+	position := make(map[int64]int, len(items))
+	for i, sbom := range items {
+		position[sbom.ID] = i
+	}
+	return position
+}
+
+// loadSBOM reconstructs a single manifest through the same reconstruction
+// rules List applies to a whole page: wrapping the record in a one-manifest
+// slice makes Register's idempotency/conflict check run exactly the queries
+// and assembly of a page read, so the two paths cannot drift apart.
 func loadSBOM(ctx context.Context, q queryer, id int64) (*model.SBOM, error) {
 	sbom := &model.SBOM{ID: id, Components: []model.Component{}}
 	if err := q.QueryRowContext(ctx,
@@ -349,49 +365,12 @@ func loadSBOM(ctx context.Context, q queryer, id int64) (*model.SBOM, error) {
 		return nil, unavailable(err)
 	}
 
-	componentRows, err := q.QueryContext(ctx,
-		"SELECT coordinate, license FROM components WHERE sbom_id = ? ORDER BY coordinate ASC", id)
-	if err != nil {
-		return nil, unavailable(err)
+	items := []*model.SBOM{sbom}
+	if err := attachComponents(ctx, q, items); err != nil {
+		return nil, err
 	}
-	defer componentRows.Close()
-
-	indexByCoordinate := make(map[string]int)
-	for componentRows.Next() {
-		var comp model.Component
-		comp.Dependencies = []string{}
-		if err := componentRows.Scan(&comp.Coordinate, &comp.License); err != nil {
-			return nil, unavailable(err)
-		}
-		indexByCoordinate[comp.Coordinate] = len(sbom.Components)
-		sbom.Components = append(sbom.Components, comp)
-	}
-	if err := componentRows.Err(); err != nil {
-		return nil, unavailable(err)
-	}
-
-	depRows, err := q.QueryContext(ctx, `
-SELECT sc.coordinate, tc.coordinate
-FROM dependencies d
-JOIN components sc ON sc.id = d.component_id
-JOIN components tc ON tc.id = d.target_id AND tc.sbom_id = sc.sbom_id
-WHERE sc.sbom_id = ?
-ORDER BY sc.coordinate ASC, tc.coordinate ASC`, id)
-	if err != nil {
-		return nil, unavailable(err)
-	}
-	defer depRows.Close()
-
-	for depRows.Next() {
-		var from, to string
-		if err := depRows.Scan(&from, &to); err != nil {
-			return nil, unavailable(err)
-		}
-		comp := &sbom.Components[indexByCoordinate[from]]
-		comp.Dependencies = append(comp.Dependencies, to)
-	}
-	if err := depRows.Err(); err != nil {
-		return nil, unavailable(err)
+	if err := attachDependencies(ctx, q, items); err != nil {
+		return nil, err
 	}
 	return sbom, nil
 }
