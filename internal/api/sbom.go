@@ -1,12 +1,9 @@
 package api
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -15,94 +12,10 @@ import (
 	"github.com/xjeey8iust/sen-sbom-inventory/internal/model"
 )
 
-// errMalformed is returned by the request decoders for every shape the API
-// contract rejects. The single error keeps SQL, paths and internals out of the
-// client-visible message.
+// errMalformed is returned by the query decoders for every shape the API
+// contract rejects. The single error keeps SQL, paths and internals out of
+// the client-visible message.
 var errMalformed = errors.New("malformed SBOM request")
-
-// componentInput is one request component after shape validation; strings are
-// already trimmed and dependencies are de-duplicated.
-type componentInput struct {
-	coordinate string
-	license    string
-	deps       []string
-}
-
-// componentsInput is the typed, validated view of the request's components
-// array. Its UnmarshalJSON enforces the array/object/string types strictly so
-// that a null, a scalar or a wrongly typed element cannot sneak in through Go's
-// lenient zero values, and detects duplicate coordinates while every JSON
-// element is still visible (plain struct decoding would silently keep the last
-// of two duplicates).
-type componentsInput []componentInput
-
-type rawComponent struct {
-	Coordinate   *string   `json:"coordinate"`
-	License      *string   `json:"license"`
-	Dependencies *[]string `json:"dependencies"`
-}
-
-func (c *componentsInput) UnmarshalJSON(data []byte) error {
-	// A JSON null is not the array the contract requires; distinguish it from
-	// an actually empty array.
-	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
-		return errMalformed
-	}
-	var raw []*rawComponent
-	if err := json.Unmarshal(data, &raw); err != nil {
-		// Type errors (components not an array, element not an object, a
-		// dependency entry not a string, ...) all collapse to the same
-		// client-fixable rejection.
-		return errMalformed
-	}
-
-	coordinates := make(map[string]struct{}, len(raw))
-	parsed := make(componentsInput, 0, len(raw))
-	for _, item := range raw {
-		if item == nil || item.Coordinate == nil || item.License == nil || item.Dependencies == nil {
-			return errMalformed
-		}
-		coordinate := strings.TrimSpace(*item.Coordinate)
-		license := strings.TrimSpace(*item.License)
-		if coordinate == "" || license == "" {
-			return errMalformed
-		}
-		if _, exists := coordinates[coordinate]; exists {
-			return errMalformed
-		}
-		coordinates[coordinate] = struct{}{}
-
-		deps := make([]string, 0, len(*item.Dependencies))
-		seen := make(map[string]struct{}, len(*item.Dependencies))
-		for _, dep := range *item.Dependencies {
-			dep = strings.TrimSpace(dep)
-			if dep == "" {
-				return errMalformed
-			}
-			if dep == coordinate {
-				return errMalformed
-			}
-			if _, exists := seen[dep]; exists {
-				return errMalformed
-			}
-			seen[dep] = struct{}{}
-			deps = append(deps, dep)
-		}
-		parsed = append(parsed, componentInput{
-			coordinate: coordinate,
-			license:    license,
-			deps:       deps,
-		})
-	}
-	*c = parsed
-	return nil
-}
-
-type registerRequest struct {
-	Artifact   string          `json:"artifact"`
-	Version    string          `json:"version"`
-	Components componentsInput `json:"components"`
-}
 
 func (h *sbomHandlers) register(c *gin.Context) {
 	body, err := io.ReadAll(c.Request.Body)
@@ -111,69 +24,21 @@ func (h *sbomHandlers) register(c *gin.Context) {
 		return
 	}
 
-	var req registerRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeAPIError(c, http.StatusBadRequest, invalidInputCode, invalidInputMessage)
-		return
-	}
-	// The body must resolve to exactly one JSON value: "{} {}" and
-	// "{} garbage" are rejected instead of silently keeping the first object.
-	if hasTrailingValue(body) {
-		writeAPIError(c, http.StatusBadRequest, invalidInputCode, invalidInputMessage)
-		return
-	}
-
-	req.Artifact = strings.TrimSpace(req.Artifact)
-	req.Version = strings.TrimSpace(req.Version)
-	if req.Artifact == "" || req.Version == "" || req.Components == nil {
+	// Parsing, validation and normalization live in model.ParseSBOM so the
+	// registration rules exist independently of HTTP and the database; every
+	// rejection it reports is a caller-fixable ErrInvalidInput.
+	sbom, err := model.ParseSBOM(body)
+	if err != nil {
 		writeAPIError(c, http.StatusBadRequest, invalidInputCode, invalidInputMessage)
 		return
 	}
 
-	coordinates := make(map[string]struct{}, len(req.Components))
-	for _, comp := range req.Components {
-		coordinates[comp.coordinate] = struct{}{}
-	}
-	components := make([]model.Component, len(req.Components))
-	for i, comp := range req.Components {
-		for _, dep := range comp.deps {
-			if _, ok := coordinates[dep]; !ok {
-				writeAPIError(c, http.StatusBadRequest, invalidInputCode, invalidInputMessage)
-				return
-			}
-		}
-		sort.Strings(comp.deps)
-		components[i] = model.Component{
-			Coordinate:   comp.coordinate,
-			License:      comp.license,
-			Dependencies: comp.deps,
-		}
-	}
-	sort.Slice(components, func(i, j int) bool { return components[i].Coordinate < components[j].Coordinate })
-
-	sbom, _, err := h.store.Register(c.Request.Context(), &model.SBOM{
-		Artifact:   req.Artifact,
-		Version:    req.Version,
-		Components: components,
-	})
+	stored, _, err := h.store.Register(c.Request.Context(), sbom)
 	if err != nil {
 		writeStoreError(c, err)
 		return
 	}
-	c.JSON(http.StatusCreated, sbom)
-}
-
-// hasTrailingValue reports whether anything but whitespace follows the first
-// top-level JSON value in body. json.Unmarshal ignores such trailing bytes, so
-// they have to be detected explicitly.
-func hasTrailingValue(body []byte) bool {
-	dec := json.NewDecoder(bytes.NewReader(body))
-	var first json.RawMessage
-	if err := dec.Decode(&first); err != nil {
-		return false // The first decode already failed; the caller rejects it.
-	}
-	var next json.RawMessage
-	return dec.Decode(&next) == nil
+	c.JSON(http.StatusCreated, stored)
 }
 
 type listResponse struct {

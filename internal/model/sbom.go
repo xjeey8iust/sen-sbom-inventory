@@ -1,5 +1,7 @@
 // Package model defines the SBOM inventory domain types and the errors shared
-// between the HTTP layer and the storage layer.
+// between the HTTP layer and the storage layer. ParseSBOM (parse.go) is the
+// transport-independent entry point that parses, validates and normalizes a
+// raw registration payload into an SBOM ready for Store.Register.
 package model
 
 import "errors"
