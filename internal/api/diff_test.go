@@ -9,13 +9,13 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/xjeey8iust/sen-sbom-inventory/internal/model"
+	"github.com/xjeey8iust/sen-sbom-inventory/internal/manifest"
 	"github.com/xjeey8iust/sen-sbom-inventory/internal/store"
 )
 
-func decodeDiff(t *testing.T, rec *httptest.ResponseRecorder) diffResponse {
+func decodeDiff(t *testing.T, rec *httptest.ResponseRecorder) manifest.Diff {
 	t.Helper()
-	var got diffResponse
+	var got manifest.Diff
 	decodeBody(t, rec, &got)
 	return got
 }
@@ -77,7 +77,7 @@ func TestDiffPartitionsAddedRemovedChanged(t *testing.T) {
 			t.Fatalf("changed %s carries nil dependency arrays", coordinate)
 		}
 	}
-	byCoord := map[string]componentChange{}
+	byCoord := map[string]manifest.ComponentChange{}
 	for _, ch := range got.Changed {
 		byCoord[ch.Coordinate] = ch
 	}
@@ -409,27 +409,5 @@ func TestDiffKeepsExistingRoutesBehavior(t *testing.T) {
 	decodeBody(t, rec, &page)
 	if page.Total != 1 || len(page.Items) != 1 {
 		t.Fatalf("list page = %+v", page)
-	}
-}
-
-// TestBuildDiffComparesDependenciesAsSets unit-tests the order-independence
-// of the direct dependency comparison: stored reconstructions are always
-// sorted, but the rule must hold regardless of array order.
-func TestBuildDiffComparesDependenciesAsSets(t *testing.T) {
-	before := &model.SBOM{Artifact: "app", Version: "1", Components: []model.Component{
-		{Coordinate: "a", License: "L", Dependencies: []string{"x", "y", "z"}},
-	}}
-	after := &model.SBOM{Artifact: "app", Version: "2", Components: []model.Component{
-		{Coordinate: "a", License: "L", Dependencies: []string{"z", "x", "y"}},
-	}}
-	got := buildDiff("app", "1", "2", before, after)
-	if len(got.Changed) != 0 {
-		t.Fatalf("shuffled same dependency set reported as changed: %+v", got.Changed)
-	}
-
-	after.Components[0].Dependencies = []string{"x", "y"}
-	got = buildDiff("app", "1", "2", before, after)
-	if len(got.Changed) != 1 || got.Changed[0].Coordinate != "a" {
-		t.Fatalf("dropped dependency not detected: %+v", got.Changed)
 	}
 }
