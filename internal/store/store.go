@@ -244,44 +244,24 @@ func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (
 			return unavailable(err)
 		}
 
-		rows, err := q.QueryContext(ctx,
+		// The page's main records, their non-nil empty component
+		// collections and the id→page-index ownership table all come from
+		// the one shared scan rule Register's reload and Diff use too.
+		batch, err := scanManifestRows(ctx, q,
 			"SELECT id, artifact, version FROM sboms WHERE artifact = ? ORDER BY id ASC LIMIT ? OFFSET ?",
 			artifact, pageSize, (page-1)*pageSize)
 		if err != nil {
-			return unavailable(err)
+			return err
 		}
-		defer rows.Close()
-
-		items = []*model.SBOM{}
-		ids := make([]int64, 0, pageSize)
-		indexByID := make(map[int64]int, pageSize)
-		for rows.Next() {
-			sbom := &model.SBOM{Components: []model.Component{}}
-			if err := rows.Scan(&sbom.ID, &sbom.Artifact, &sbom.Version); err != nil {
-				return unavailable(err)
-			}
-			ids = append(ids, sbom.ID)
-			indexByID[sbom.ID] = len(items)
-			items = append(items, sbom)
-		}
-		if err := rows.Err(); err != nil {
-			return unavailable(err)
-		}
+		items = batch.items
 
 		// Empty page (unknown artifact or a page past the last one): the count
 		// was already read, and the two detail queries must not run with an
 		// empty IN list. Total is still returned to the caller.
-		if len(ids) == 0 {
+		if len(batch.ids) == 0 {
 			return nil
 		}
-
-		if err := loadComponentsInto(ctx, q, items, ids, indexByID); err != nil {
-			return err
-		}
-		if err := loadDependenciesInto(ctx, q, items, ids, indexByID); err != nil {
-			return err
-		}
-		return nil
+		return attachDetails(ctx, q, batch)
 	})
 	if txErr != nil {
 		return nil, 0, txErr
@@ -324,22 +304,14 @@ ORDER BY id ASC`
 		}
 		defer rows.Close()
 
-		items := []*model.SBOM{}
-		ids := make([]int64, 0, len(versions))
-		indexByID := make(map[int64]int, len(versions))
-		byVersion := make(map[string]*model.SBOM, len(versions))
-		for rows.Next() {
-			sbom := &model.SBOM{Components: []model.Component{}}
-			if err := rows.Scan(&sbom.ID, &sbom.Artifact, &sbom.Version); err != nil {
-				return unavailable(err)
-			}
-			ids = append(ids, sbom.ID)
-			indexByID[sbom.ID] = len(items)
-			items = append(items, sbom)
-			byVersion[sbom.Version] = sbom
+		batch, err := collectManifestRows(rows)
+		if err != nil {
+			return err
 		}
-		if err := rows.Err(); err != nil {
-			return unavailable(err)
+
+		byVersion := make(map[string]*model.SBOM, len(batch.ids))
+		for _, sbom := range batch.items {
+			byVersion[sbom.Version] = sbom
 		}
 
 		// Existence is settled against this snapshot before any detail read;
@@ -354,13 +326,7 @@ ORDER BY id ASC`
 		// self-comparison manifest), through the same loaders List and
 		// Register use, so components and direct dependency edges follow the
 		// one reconstruction rule.
-		if err := loadComponentsInto(ctx, q, items, ids, indexByID); err != nil {
-			return err
-		}
-		if err := loadDependenciesInto(ctx, q, items, ids, indexByID); err != nil {
-			return err
-		}
-		return nil
+		return attachDetails(ctx, q, batch)
 	})
 	if txErr != nil {
 		return nil, nil, txErr
@@ -463,11 +429,72 @@ func int64Args(ids []int64) []any {
 	return args
 }
 
+// manifestBatch is the shared shape of one read of sbom main records: the
+// reconstructed manifests (each starting with a non-nil empty component
+// collection), their database IDs and the map that attributes a detail row
+// back to its manifest. Register's reload, List's page scan and Diff's
+// paired-version scan all produce one, so main-record parsing, empty-slice
+// initialization and detail ownership live in exactly one place.
+type manifestBatch struct {
+	items     []*model.SBOM
+	ids       []int64
+	indexByID map[int64]int
+}
+
+// scanManifestRows runs query, drains every main-record row through
+// collectManifestRows and closes the cursor. It is the shared entry for a
+// main-record scan (List's paged read and Diff's version read); the single
+// manifest Register reloads by id keeps its point QueryRow path.
+func scanManifestRows(ctx context.Context, q queryer, query string, args ...any) (manifestBatch, error) {
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return manifestBatch{}, unavailable(err)
+	}
+	defer rows.Close()
+	return collectManifestRows(rows)
+}
+
+// collectManifestRows scans an open sbom cursor into a manifestBatch. Every
+// manifest starts with a non-nil empty Components slice, and ownership of
+// each row is recorded as it is appended, so an empty result comes back as
+// a usable empty batch rather than a nil one.
+func collectManifestRows(rows *sql.Rows) (manifestBatch, error) {
+	batch := manifestBatch{
+		items:     []*model.SBOM{},
+		ids:       []int64{},
+		indexByID: map[int64]int{},
+	}
+	for rows.Next() {
+		sbom := &model.SBOM{Components: []model.Component{}}
+		if err := rows.Scan(&sbom.ID, &sbom.Artifact, &sbom.Version); err != nil {
+			return manifestBatch{}, unavailable(err)
+		}
+		batch.indexByID[sbom.ID] = len(batch.items)
+		batch.ids = append(batch.ids, sbom.ID)
+		batch.items = append(batch.items, sbom)
+	}
+	if err := rows.Err(); err != nil {
+		return manifestBatch{}, unavailable(err)
+	}
+	return batch, nil
+}
+
+// attachDetails runs the two batched detail loaders for one manifestBatch in
+// their fixed order. It is the single reconstruction tail of every read
+// path: Register's idempotency/conflict reload, List's page and Diff's
+// paired versions all attach components then dependency edges the same way.
+func attachDetails(ctx context.Context, q queryer, batch manifestBatch) error {
+	if err := loadComponentsInto(ctx, q, batch.items, batch.ids, batch.indexByID); err != nil {
+		return err
+	}
+	return loadDependenciesInto(ctx, q, batch.items, batch.ids, batch.indexByID)
+}
+
 // loadSBOM reconstructs a single stored manifest for Register's
 // idempotency/conflict check. It reads the manifest row itself, then rebuilds
-// components and dependencies through the same loaders List applies to a
-// page, so the registration read path and the paged read path share one
-// reconstruction rule by construction.
+// components and dependencies through the same attachDetails tail List and
+// Diff apply, so the registration read path and the paged/paired read paths
+// share one reconstruction rule by construction.
 func loadSBOM(ctx context.Context, q queryer, id int64) (*model.SBOM, error) {
 	sbom := &model.SBOM{ID: id, Components: []model.Component{}}
 	if err := q.QueryRowContext(ctx,
@@ -476,15 +503,13 @@ func loadSBOM(ctx context.Context, q queryer, id int64) (*model.SBOM, error) {
 		return nil, unavailable(err)
 	}
 
-	// A one-manifest page: the shared loaders keep the component and
-	// dependency ordering/scoping rules identical to List's paged reads.
-	items := []*model.SBOM{sbom}
-	ids := []int64{id}
-	indexByID := map[int64]int{id: 0}
-	if err := loadComponentsInto(ctx, q, items, ids, indexByID); err != nil {
-		return nil, err
-	}
-	if err := loadDependenciesInto(ctx, q, items, ids, indexByID); err != nil {
+	// A one-manifest batch hands the single record straight to the shared
+	// detail loaders without a second sbom SELECT.
+	if err := attachDetails(ctx, q, manifestBatch{
+		items:     []*model.SBOM{sbom},
+		ids:       []int64{id},
+		indexByID: map[int64]int{id: 0},
+	}); err != nil {
 		return nil, err
 	}
 	return sbom, nil
