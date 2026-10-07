@@ -233,9 +233,9 @@ func (s *Store) Register(ctx context.Context, in *model.SBOM) (sbom *model.SBOM,
 // the components/dependencies of that page are each read in one batched query
 // (four SELECTs at most, regardless of page size) inside one transaction, so
 // the total and the details share one committed snapshot and detail rows are
-// never fetched for other pages or other artifacts. The detail reads go
-// through the same loadComponentsInto/loadDependenciesInto loaders that
-// Register's idempotency check uses, keeping one reconstruction rule.
+// never fetched for other pages or other artifacts. The page is assembled
+// through the same manifestSet/scanManifests rule that Register's read-back
+// and Diff use, keeping one reconstruction rule across all three read paths.
 func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (items []*model.SBOM, total int, err error) {
 	txErr := s.withTx(ctx, txDeferred, func(q preparer) error {
 		if err := q.QueryRowContext(ctx,
@@ -252,36 +252,20 @@ func (s *Store) List(ctx context.Context, artifact string, page, pageSize int) (
 		}
 		defer rows.Close()
 
-		items = []*model.SBOM{}
-		ids := make([]int64, 0, pageSize)
-		indexByID := make(map[int64]int, pageSize)
-		for rows.Next() {
-			sbom := &model.SBOM{Components: []model.Component{}}
-			if err := rows.Scan(&sbom.ID, &sbom.Artifact, &sbom.Version); err != nil {
-				return unavailable(err)
-			}
-			ids = append(ids, sbom.ID)
-			indexByID[sbom.ID] = len(items)
-			items = append(items, sbom)
+		set, err := scanManifests(rows)
+		if err != nil {
+			return err
 		}
-		if err := rows.Err(); err != nil {
-			return unavailable(err)
-		}
+		items = set.items
 
 		// Empty page (unknown artifact or a page past the last one): the count
 		// was already read, and the two detail queries must not run with an
 		// empty IN list. Total is still returned to the caller.
-		if len(ids) == 0 {
+		if len(set.ids) == 0 {
 			return nil
 		}
 
-		if err := loadComponentsInto(ctx, q, items, ids, indexByID); err != nil {
-			return err
-		}
-		if err := loadDependenciesInto(ctx, q, items, ids, indexByID); err != nil {
-			return err
-		}
-		return nil
+		return set.loadDetails(ctx, q)
 	})
 	if txErr != nil {
 		return nil, 0, txErr
@@ -324,22 +308,13 @@ ORDER BY id ASC`
 		}
 		defer rows.Close()
 
-		items := []*model.SBOM{}
-		ids := make([]int64, 0, len(versions))
-		indexByID := make(map[int64]int, len(versions))
-		byVersion := make(map[string]*model.SBOM, len(versions))
-		for rows.Next() {
-			sbom := &model.SBOM{Components: []model.Component{}}
-			if err := rows.Scan(&sbom.ID, &sbom.Artifact, &sbom.Version); err != nil {
-				return unavailable(err)
-			}
-			ids = append(ids, sbom.ID)
-			indexByID[sbom.ID] = len(items)
-			items = append(items, sbom)
-			byVersion[sbom.Version] = sbom
+		set, err := scanManifests(rows)
+		if err != nil {
+			return err
 		}
-		if err := rows.Err(); err != nil {
-			return unavailable(err)
+		byVersion := make(map[string]*model.SBOM, len(versions))
+		for _, sbom := range set.items {
+			byVersion[sbom.Version] = sbom
 		}
 
 		// Existence is settled against this snapshot before any detail read;
@@ -351,16 +326,10 @@ ORDER BY id ASC`
 		}
 
 		// One batched read per detail table for both manifests (or the single
-		// self-comparison manifest), through the same loaders List and
+		// self-comparison manifest), through the same assembly List and
 		// Register use, so components and direct dependency edges follow the
 		// one reconstruction rule.
-		if err := loadComponentsInto(ctx, q, items, ids, indexByID); err != nil {
-			return err
-		}
-		if err := loadDependenciesInto(ctx, q, items, ids, indexByID); err != nil {
-			return err
-		}
-		return nil
+		return set.loadDetails(ctx, q)
 	})
 	if txErr != nil {
 		return nil, nil, txErr
@@ -368,12 +337,78 @@ ORDER BY id ASC`
 	return fromSBOM, toSBOM, nil
 }
 
+// manifestSet is the shared result of assembling manifest master records: the
+// records themselves plus the lookup structures the detail loaders need to
+// attach components and dependencies to their owning manifest. Register's
+// read-back (through loadSBOM), List and Diff all build their manifests
+// through it, so master-record parsing, empty-collection initialization and
+// detail attribution live in exactly one place instead of being maintained
+// per read path.
+type manifestSet struct {
+	items     []*model.SBOM
+	ids       []int64
+	indexByID map[int64]int
+}
+
+func newManifestSet(capacity int) *manifestSet {
+	return &manifestSet{
+		items:     []*model.SBOM{},
+		ids:       make([]int64, 0, capacity),
+		indexByID: make(map[int64]int, capacity),
+	}
+}
+
+// add appends one master record. The component collection is initialized here
+// — and nowhere else — so every read path emits an empty array rather than
+// null for a manifest without components.
+func (m *manifestSet) add(id int64, artifact, version string) *model.SBOM {
+	sbom := &model.SBOM{
+		ID:         id,
+		Artifact:   artifact,
+		Version:    version,
+		Components: []model.Component{},
+	}
+	m.indexByID[id] = len(m.items)
+	m.ids = append(m.ids, id)
+	m.items = append(m.items, sbom)
+	return sbom
+}
+
+// scanManifests drains a cursor of (id, artifact, version) master rows into a
+// manifestSet, preserving the cursor's ordering. It is the single
+// master-record parsing rule of the service; the caller keeps ownership of
+// the cursor (and its Close).
+func scanManifests(rows *sql.Rows) (*manifestSet, error) {
+	set := newManifestSet(0)
+	for rows.Next() {
+		var id int64
+		var artifact, version string
+		if err := rows.Scan(&id, &artifact, &version); err != nil {
+			return nil, unavailable(err)
+		}
+		set.add(id, artifact, version)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, unavailable(err)
+	}
+	return set, nil
+}
+
+// loadDetails completes the reconstruction of every manifest in the set
+// through the shared component/dependency loaders: one batched query per
+// detail table, with each detail row attributed to its owning manifest.
+func (m *manifestSet) loadDetails(ctx context.Context, q queryer) error {
+	if err := loadComponentsInto(ctx, q, m.items, m.ids, m.indexByID); err != nil {
+		return err
+	}
+	return loadDependenciesInto(ctx, q, m.items, m.ids, m.indexByID)
+}
+
 // loadComponentsInto reads every component of the given manifests in one
 // query and attaches the ordered components to their manifests. It is the
-// single component reconstruction rule of the service: List calls it for the
-// current page, and Register's idempotency/conflict check calls it (through
-// loadSBOM) for the one stored manifest, so both read paths rebuild
-// components exactly the same way.
+// single component reconstruction rule of the service: every read path
+// (Register's read-back, List, Diff) reaches it through manifestSet.loadDetails,
+// so all three rebuild components exactly the same way.
 func loadComponentsInto(ctx context.Context, q queryer, items []*model.SBOM, ids []int64, indexByID map[int64]int) error {
 	query := `
 SELECT c.sbom_id, c.coordinate, c.license
@@ -403,8 +438,8 @@ ORDER BY c.sbom_id ASC, c.coordinate ASC`
 // one query. Both endpoints belong to the same manifest: the JOIN on sbom_id
 // keeps edges scoped to the given manifests and also prevents a target row
 // from another version ever matching when coordinates repeat across versions.
-// Like loadComponentsInto it is shared by List (for a page) and by Register's
-// idempotency/conflict check (through loadSBOM, for a single manifest).
+// Like loadComponentsInto it is reached by every read path (Register's
+// read-back, List, Diff) through manifestSet.loadDetails.
 func loadDependenciesInto(ctx context.Context, q queryer, items []*model.SBOM, ids []int64, indexByID map[int64]int) error {
 	query := `
 SELECT sc.sbom_id, sc.coordinate, tc.coordinate
@@ -464,30 +499,33 @@ func int64Args(ids []int64) []any {
 }
 
 // loadSBOM reconstructs a single stored manifest for Register's
-// idempotency/conflict check. It reads the manifest row itself, then rebuilds
-// components and dependencies through the same loaders List applies to a
-// page, so the registration read path and the paged read path share one
-// reconstruction rule by construction.
+// idempotency/conflict check. It assembles the manifest through the same
+// scanManifests/manifestSet rule List applies to a page and Diff applies to
+// its two versions, so the registration read path, the paged read path and
+// the comparison read path share one reconstruction rule by construction.
 func loadSBOM(ctx context.Context, q queryer, id int64) (*model.SBOM, error) {
-	sbom := &model.SBOM{ID: id, Components: []model.Component{}}
-	if err := q.QueryRowContext(ctx,
-		"SELECT artifact, version FROM sboms WHERE id = ?", id,
-	).Scan(&sbom.Artifact, &sbom.Version); err != nil {
+	rows, err := q.QueryContext(ctx,
+		"SELECT id, artifact, version FROM sboms WHERE id = ?", id)
+	if err != nil {
 		return nil, unavailable(err)
 	}
+	defer rows.Close()
 
-	// A one-manifest page: the shared loaders keep the component and
-	// dependency ordering/scoping rules identical to List's paged reads.
-	items := []*model.SBOM{sbom}
-	ids := []int64{id}
-	indexByID := map[int64]int{id: 0}
-	if err := loadComponentsInto(ctx, q, items, ids, indexByID); err != nil {
+	// A one-manifest page: the shared assembly keeps the master-record,
+	// component and dependency rules identical to List's paged reads.
+	set, err := scanManifests(rows)
+	if err != nil {
 		return nil, err
 	}
-	if err := loadDependenciesInto(ctx, q, items, ids, indexByID); err != nil {
+	if len(set.items) != 1 {
+		// The ID was selected from this same table a moment ago; anything but
+		// exactly one master row means the storage layer misbehaved.
+		return nil, unavailable(fmt.Errorf("sbom %d: found %d master rows", id, len(set.items)))
+	}
+	if err := set.loadDetails(ctx, q); err != nil {
 		return nil, err
 	}
-	return sbom, nil
+	return set.items[0], nil
 }
 
 // equalContent compares normalized manifests (sorted components and
