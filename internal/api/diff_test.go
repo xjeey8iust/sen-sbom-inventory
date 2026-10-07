@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/xjeey8iust/sen-sbom-inventory/internal/model"
+	"github.com/xjeey8iust/sen-sbom-inventory/internal/manifest"
 	"github.com/xjeey8iust/sen-sbom-inventory/internal/store"
 )
 
@@ -412,24 +412,41 @@ func TestDiffKeepsExistingRoutesBehavior(t *testing.T) {
 	}
 }
 
-// TestBuildDiffComparesDependenciesAsSets unit-tests the order-independence
-// of the direct dependency comparison: stored reconstructions are always
-// sorted, but the rule must hold regardless of array order.
-func TestBuildDiffComparesDependenciesAsSets(t *testing.T) {
-	before := &model.SBOM{Artifact: "app", Version: "1", Components: []model.Component{
-		{Coordinate: "a", License: "L", Dependencies: []string{"x", "y", "z"}},
-	}}
-	after := &model.SBOM{Artifact: "app", Version: "2", Components: []model.Component{
-		{Coordinate: "a", License: "L", Dependencies: []string{"z", "x", "y"}},
-	}}
-	got := buildDiff("app", "1", "2", before, after)
-	if len(got.Changed) != 0 {
-		t.Fatalf("shuffled same dependency set reported as changed: %+v", got.Changed)
+// TestDiffHTTPResponseMatchesDirectCompare proves the handler and the
+// standalone library entry are the same comparison: the body GET /sboms/diff
+// returns is byte-for-byte the JSON of manifest.Compare run on the same two
+// stored manifests.
+func TestDiffHTTPResponseMatchesDirectCompare(t *testing.T) {
+	router, st := newTestRouter(t)
+	postSBOM(t, router, `{"artifact":"app","version":"1","components":[
+		{"coordinate":"gone","license":"G","dependencies":[]},
+		{"coordinate":"stable","license":"S","dependencies":[]},
+		{"coordinate":"rel","license":"OLD","dependencies":["stable"]}
+	]}`)
+	postSBOM(t, router, `{"artifact":"app","version":"2","components":[
+		{"coordinate":"born","license":"B","dependencies":[]},
+		{"coordinate":"stable","license":"S","dependencies":[]},
+		{"coordinate":"rel","license":"NEW","dependencies":["born","stable"]}
+	]}`)
+
+	rec := getSBOMs(t, router, "/sboms/diff?artifact=app&fromVersion=1&toVersion=2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
 	}
 
-	after.Components[0].Dependencies = []string{"x", "y"}
-	got = buildDiff("app", "1", "2", before, after)
-	if len(got.Changed) != 1 || got.Changed[0].Coordinate != "a" {
-		t.Fatalf("dropped dependency not detected: %+v", got.Changed)
+	before, after, err := st.Diff(t.Context(), "app", "1", "2")
+	if err != nil {
+		t.Fatalf("store diff: %v", err)
+	}
+	direct, err := manifest.Compare(before, after)
+	if err != nil {
+		t.Fatalf("direct compare: %v", err)
+	}
+	want, err := json.Marshal(direct)
+	if err != nil {
+		t.Fatalf("marshal direct result: %v", err)
+	}
+	if !bytes.Equal(bytes.TrimSpace(rec.Body.Bytes()), want) {
+		t.Fatalf("HTTP body differs from direct compare:\nHTTP:   %s\ndirect: %s", rec.Body.String(), want)
 	}
 }
